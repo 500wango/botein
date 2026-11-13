@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Botein · 海外品牌研究</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&display=swap" rel="stylesheet" referrerpolicy="no-referrer">
+  <link rel="stylesheet" href="/assets/vercel-brand.css">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body class="vbg-report">
+  <a class="sn-skip" href="#main">跳至主要内容</a>
+  <main id="auth-screen" tabindex="-1" class="sn-auth" aria-labelledby="auth-title">
+    <a class="sn-brand" href="/">Botein</a>
+    <div class="sn-auth-panel">
+      <p class="sn-kicker">本地工作空间</p><h1 id="auth-title">正在检查登录状态…</h1>
+      <p id="auth-description" class="sn-description">已有资料保存在本机，读取业务数据前需要负责人登录。</p>
+      <form id="auth-form" hidden>
+        <label class="sn-field" id="auth-display-field" hidden>负责人称呼<input name="display_name" autocomplete="name" maxlength="100"></label>
+        <label class="sn-field">登录账号<input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="64" required><span id="auth-username-help" class="sn-helper" hidden>1–64 个字符，支持中文、空格和常用符号；忽略首尾空白及英文大小写。</span></label>
+        <label class="sn-field">密码<input name="password" type="password" autocomplete="current-password" required><span class="sn-helper" id="auth-password-help">支持粘贴和密码管理器。</span></label>
+        <label class="sn-field" id="auth-confirm-field" hidden>再次输入密码<input name="confirm_password" type="password" autocomplete="new-password"></label>
+        <p class="sn-form-error" id="auth-error" role="alert" hidden></p>
+        <button class="sn-button" type="submit">登录</button>
+      </form>
+      <button class="sn-button sn-secondary" id="auth-retry" type="button" hidden>重新检查连接</button>
+      <p id="auth-feedback" role="status" aria-live="polite" class="sn-helper"></p>
+      <p class="sn-helper">账号仅用于这台机器的工作空间，不验证邮箱，不开通外部服务，也不创建团队成员。请妥善保管密码，当前没有邮件找回。</p>
+    </div>
+  </main>
+  <div class="sn-app" id="workspace-shell" hidden>
+    <header class="sn-header">
+      <a class="sn-brand" href="#research" aria-label="Botein 研究工作台">Botein</a>
+      <div class="sn-workspace">LANCCO <span class="sn-muted" id="signed-in-owner"></span> <button class="sn-button sn-secondary" id="logout-button" type="button">退出登录</button></div>
+    </header>
+    <nav class="sn-nav" aria-label="主导航">
+      <a href="#research" data-page="research">市场研究</a>
+      <a href="#opportunities" data-page="opportunities">商机跟进</a>
+      <a href="#followups" data-page="followups">跟进待办</a>
+      <a href="#analytics" data-page="analytics">销售漏斗</a>
+      <a href="#factory" data-page="factory">工厂档案</a>
+      <a href="#accounts" data-page="accounts">品牌池</a>
+      <a href="#evidence" data-page="evidence">证据资料</a>
+      <a href="#settings" data-page="settings">接入状态</a>
+    </nav>
+    <main id="main" tabindex="-1">
+      <div id="notice" class="sn-notice" role="status" aria-live="polite" hidden></div>
+      <section data-view="research">
+        <div class="sn-page-heading"><div><p class="sn-kicker">海外品牌开发</p><h1>从一个市场开始。</h1><p class="sn-description">把公开线索整理成有依据、值得联系的品牌机会。</p></div><span class="sn-state">本地开发版</span></div>
+        <div class="sn-research-layout">
+          <form id="research-form" class="sn-research-panel">
+            <h2>新建市场研究</h2><p class="sn-muted">产品范围继承工厂档案，你只需选择目标市场。</p>
+            <label class="sn-field">目标市场<select name="market"><option value="US">美国 United States</option></select></label>
+            <div class="sn-product-line"><span>目标品类</span><strong>洗衣凝珠</strong><span class="sn-muted">Laundry pods</span></div>
+            <label class="sn-field">来源模式<select name="source_mode"><option value="DISCOVERY">自动发现（来源尚未接入）</option><option value="POOL">仅分析品牌池（当前可用）</option></select><span class="sn-helper">自动发现没有可用来源时返回 503，不创建空转任务；品牌池模式只整理已经保存并核验的资料。</span></label>
+            <div class="sn-form-row">
+              <label class="sn-field">最多返回多少个机会<input name="quantity" type="number" min="1" max="50" value="20" required><span class="sn-helper">实际结果以证据为准，资料不足时不凑数。</span></label>
+              <label class="sn-field">证据门槛<select name="min_evidence_quality"><option value="MEDIUM">MEDIUM · 已人工核验</option><option value="HIGH">HIGH · 当前无来源类型记录</option></select><span class="sn-helper">HIGH 需要记录第一方来源属性，当前规则只能判定 MEDIUM。</span></label>
+            </div>
+            <button class="sn-button" type="submit" disabled>开始研究</button>
+            <p id="research-blocker" class="sn-helper" aria-live="polite">正在读取接入状态…</p>
+            <p class="sn-form-error" role="alert" hidden></p>
+          </form>
+          <aside class="sn-preparation" aria-label="研究准备情况">
+            <h2>研究开始前</h2>
+            <ol class="sn-checklist">
+              <li><div><strong>确认工厂能力</strong><span id="factory-readiness">正在读取档案…</span></div><a href="#factory">查看档案</a></li>
+              <li><div><strong>连接搜索服务</strong><span>找到品牌官网，保留原始证据。</span></div><a href="#settings">尚未接入</a></li>
+              <li><div><strong>连接模型网关</strong><span>分析匹配原因，生成待审核草稿。</span></div><a href="#settings">稍后接入</a></li>
+            </ol>
+            <div class="sn-flow"><h3>结果如何交给你</h3><p>品牌与产品 → 证据与匹配 → 联系人和草稿</p><p class="sn-muted">由你审核、确认并人工发送，系统不自动触达客户。</p></div>
+          </aside>
+        </div>
+        <section class="sn-lower-section" aria-labelledby="research-results-title">
+          <div class="sn-section-heading"><h2 id="research-results-title">研究结果</h2><span id="research-result-count" class="sn-muted"></span></div>
+          <p class="sn-helper">结果按证据门槛分档，只使用已保存的品牌、产品、证据和人工审核记录。研究不会自动确认商机，也不会生成 AI 草稿。</p>
+          <div id="research-results"><p class="sn-muted">选择“仅分析品牌池”运行一次研究后，这里会显示分档结果与缺失资料。</p></div>
+        </section>
+        <section class="sn-lower-section" aria-labelledby="research-jobs-title">
+          <div class="sn-section-heading"><h2 id="research-jobs-title">研究任务</h2><span id="research-job-count" class="sn-muted"></span><a class="sn-text-link" href="#settings">查看接入状态</a></div>
+          <div id="research-job-list"><p class="sn-muted">还没有研究任务。</p></div>
+        </section>
+        <section class="sn-lower-section" aria-labelledby="recent-title">
+          <div class="sn-section-heading"><h2 id="recent-title">接下来要跟进</h2><a class="sn-text-link" href="#followups">查看全部待办</a></div>
+          <div id="home-followups"><p class="sn-muted">正在读取待办…</p></div>
+        </section>
+      </section>
+      <section data-view="factory" hidden>
+        <div class="sn-page-heading"><div><p class="sn-kicker">匹配依据</p><h1>工厂能力档案</h1><p class="sn-description">官网信息已预填。确认基础承接能力，未知参数可以留空。</p></div><span id="factory-status" class="sn-state">读取中</span></div>
+        <div class="sn-editor-layout">
+          <div>
+            <form id="factory-form" class="sn-form">
+              <label class="sn-field">工厂名称<input name="factory_name" maxlength="100" required autocomplete="organization"></label>
+              <label class="sn-field">官网<input name="website" type="url" required autocomplete="url"></label>
+              <fieldset class="sn-fieldset"><legend>产品品类</legend><label class="sn-check"><input type="checkbox" name="supported_products" value="LAUNDRY_PODS">洗衣凝珠</label></fieldset>
+              <fieldset class="sn-fieldset"><legend>服务类型</legend><div class="sn-inline"><label class="sn-check"><input type="checkbox" name="service_type" value="OEM">OEM 贴牌生产</label><label class="sn-check"><input type="checkbox" name="service_type" value="ODM">ODM 配方开发</label></div></fieldset>
+              <fieldset class="sn-fieldset"><legend>市场承接能力</legend><label class="sn-check"><input type="checkbox" name="target_markets" value="US">确认可承接美国市场</label><p class="sn-helper">全球出口介绍不等于已确认美国市场能力，请由工厂负责人核对。</p></fieldset>
+              <div class="sn-form-row"><label class="sn-field">起订量<input name="moq_quantity" type="number" min="1" step="1" placeholder="未知可留空"></label><label class="sn-field">计量单位<select name="unit"><option value="">待确认</option><option value="POD">粒</option><option value="BAG">袋</option><option value="BOX">盒</option><option value="CARTON">箱</option></select></label><label class="sn-field">交期（天）<input name="lead_time_days" type="number" min="1" step="1" placeholder="未知可留空"></label></div>
+              <label class="sn-field">适用配方和包装条件<input name="packaging_spec" maxlength="500" placeholder="例如：LunaSquare 四腔，定制配方，包装待确认"><span class="sn-helper">填写 MOQ 时必填，不把单一产品条件外推到所有产品。</span></label>
+              <label class="sn-field">能力说明与待核实事项<textarea name="notes" rows="4" maxlength="4000"></textarea></label>
+              <p class="sn-form-error" role="alert" hidden></p>
+              <div class="sn-actions"><button class="sn-button" type="submit" disabled>保存草稿</button><span id="factory-version" class="sn-helper"></span></div>
+            </form>
+            <form id="activate-form" class="sn-activation">
+              <h2>启用基础档案</h2><label class="sn-check"><input name="confirmed" type="checkbox" required>我已核对已保存的产品、服务类型和市场承接能力。</label>
+              <p class="sn-helper">启用不等于认证、产能或性能承诺已经核验。编辑并保存后需重新确认。</p>
+              <p class="sn-form-error" role="alert" hidden></p><button class="sn-button sn-secondary" type="submit" disabled>确认并启用</button>
+            </form>
+          </div>
+          <aside class="sn-sources"><h2>官网原始资料</h2><p class="sn-muted">官网声明 · 2026-11-12 读取<br>待内部核验</p><div id="factory-sources"></div><h3>可引用工厂能力</h3><p class="sn-helper">基础档案启用后，逐字段核对实际能力及适用条件。认证、性能与自由文本暂不支持直接核验。</p><button class="sn-button sn-secondary" id="check-capability" type="button" disabled>核验能力字段</button><div id="capability-summary"></div><h3>已启用版本</h3><ul id="factory-history" class="sn-history"><li>尚无已启用版本</li></ul></aside>
+        </div>
+      </section>
+      <section data-view="accounts" hidden>
+        <div class="sn-page-heading"><div><p class="sn-kicker">客户研究起点</p><h1>品牌池</h1><p class="sn-description">保存已知品牌。品牌归属、产品与目标市场由后续证据支持。</p></div><button class="sn-button" data-open="account-dialog" disabled>新增品牌</button></div>
+        <div class="sn-toolbar"><label class="sn-search">筛选品牌<input id="account-filter" type="search" placeholder="搜索名称或域名"></label><span id="account-count" class="sn-muted">读取中</span><button class="sn-button sn-secondary" data-open="import-dialog" disabled>导入 CSV</button></div>
+        <div id="account-list" class="sn-table-region" aria-live="polite"></div>
+        <section class="sn-lower-section" aria-labelledby="identity-title"><div class="sn-section-heading"><h2 id="identity-title">同域名品牌身份核对</h2><span id="identity-count" class="sn-muted"></span></div><p class="sn-helper">先核对品牌身份，再决定新增独立品牌、复用已有记录或排除。不会自动合并历史资料。</p><div id="identity-list"></div></section>
+      </section>
+      <section data-view="evidence" hidden>
+        <div class="sn-page-heading"><div><p class="sn-kicker">事实与出处</p><h1>证据资料</h1><p class="sn-description">保存原文和来源。录入完成不等于来源已核验，也不等于采购意向。</p></div><button id="add-evidence" class="sn-button" data-open="evidence-dialog" disabled>记录证据</button></div>
+        <div class="sn-toolbar"><button class="sn-button sn-secondary" data-open="evidence-import-dialog">导入证据 CSV</button><span class="sn-helper">每次最多 500 行，逐行显示结果；只新增待核验证据。</span></div>
+        <div id="evidence-list" class="sn-evidence-list" aria-live="polite"></div>
+      </section>
+      <section data-view="opportunities" hidden>
+        <div class="sn-page-heading"><div><p class="sn-kicker">从线索到跟进</p><h1>商机跟进</h1><p class="sn-description">基于真实证据人工判断，联系人和销售记录集中在同一个商机里。</p></div><button id="add-opportunity" class="sn-button" data-open="opportunity-dialog" disabled>添加已有品牌</button></div>
+        <div class="sn-toolbar"><label class="sn-search">审核状态<select id="opportunity-filter"><option value="ALL">全部商机</option><option value="PENDING">待处理</option><option value="QUALIFIED">已合格</option><option value="REJECTED">不合格</option><option value="ARCHIVED">已归档</option></select></label><span id="opportunity-count" class="sn-muted"></span></div>
+        <div class="sn-opportunity-layout"><div id="opportunity-list" aria-label="商机列表"></div><div id="opportunity-detail" aria-live="polite"><div class="sn-empty"><h2>先选择一个商机</h2><p>从品牌池添加，核对品类、美国在售证据与开发理由，再记录跟进进展。</p></div></div></div>
+      </section>
+      <section data-view="followups" hidden>
+        <div class="sn-page-heading"><div><p class="sn-kicker">把下一步安排好</p><h1>跟进待办</h1><p class="sn-description">按截止时间处理事项。完成待办不代表已发送邮件，也不会自动改变销售阶段。</p></div><button id="add-followup" class="sn-button" data-task-new="" disabled>新增待办</button></div>
+        <div class="sn-toolbar"><label class="sn-search">查看范围<select id="followup-filter"><option value="OPEN">待处理</option><option value="OVERDUE">已逾期</option><option value="TODAY">今天到期</option><option value="DONE">已完成</option><option value="CANCELLED">已取消</option><option value="ALL">全部待办</option></select></label><span id="followup-count" class="sn-muted"></span><button class="sn-button sn-secondary" data-refresh-followups>刷新待办</button></div>
+        <p class="sn-helper">截止时间按当前浏览器时区显示；当前负责人统一为本地负责人，不发送外部提醒。</p>
+        <div id="followup-list" aria-live="polite"></div>
+      </section>
+      <section data-view="analytics" hidden>
+        <div class="sn-page-heading"><div><p class="sn-kicker">看清真实进展</p><h1>销售漏斗</h1><p class="sn-description">选择同一批创建的商机，查看截至观察时间的去重结果。</p></div></div>
+        <form id="analytics-form" class="sn-report-filter">
+          <div class="sn-report-inputs"><label class="sn-field">商机创建开始日（UTC）<input type="date" name="from" required></label><label class="sn-field">商机创建结束日（UTC）<input type="date" name="to" required></label><label class="sn-field">观察截止时间<input type="datetime-local" name="as_of"><span class="sn-helper">按本机时区输入，留空统计到当前时间。</span></label><button class="sn-button" type="submit" data-busy-label="正在统计…">更新统计</button></div>
+          <p class="sn-form-error" role="alert" hidden></p>
+        </form>
+        <div id="analytics-results" aria-live="polite"></div>
+      </section>
+      <section data-view="settings" hidden>
+        <div class="sn-page-heading"><div><p class="sn-kicker">连接研究能力</p><h1>接入状态</h1><p class="sn-description">先整理业务资料，模型和搜索服务稍后连接。</p></div></div>
+        <section class="sn-auth-settings"><h2>负责人账号</h2><p id="auth-session-info" class="sn-helper"></p><button class="sn-button sn-secondary" id="open-password-change" type="button">修改密码并退出其他会话</button> <button class="sn-button sn-secondary" id="open-session-manager" type="button">查看有效登录</button></section>
+        <section class="sn-lower-section" aria-labelledby="source-settings-title">
+          <div class="sn-section-heading"><h2 id="source-settings-title">研究来源</h2><span id="source-count" class="sn-muted"></span><button class="sn-button sn-secondary" type="button" data-open="source-dialog" disabled>登记来源</button></div>
+          <p class="sn-helper">自动发现来源启用前需登记使用方式、授权或允许使用记录、允许域名、限速和保留方式。登记与启用不等于执行适配器已接入，当前不会自动抓取。</p>
+          <p id="source-readiness" class="sn-helper" role="status" aria-live="polite">正在读取来源状态…</p>
+          <div id="source-list"></div>
+        </section>
+        <div id="integration-list" class="sn-integrations"></div>
+        <section class="sn-lower-section"><h2>联系人资料与禁止联系记录</h2><p class="sn-helper">集中核对本工作空间的联系人。禁止联系按邮箱在组织内生效，不随重复录入或编辑身份资料解除。</p><button class="sn-button sn-secondary" id="open-contact-directory" type="button">查看联系人与禁止联系记录</button></section>
+        <section class="sn-lower-section" aria-labelledby="export-title"><h2 id="export-title">导出业务资料</h2><p class="sn-helper">导出当前工作空间全部记录，包含归档、失效及待核验状态，不沿用页面筛选。仅生成本地下载，不发送给任何外部服务。</p>
+          <div class="sn-actions"><button class="sn-button sn-secondary" data-export="accounts">导出全部品牌</button><button class="sn-button sn-secondary" data-export="products">导出全部产品</button><button class="sn-button sn-secondary" data-export="evidence">导出全部证据</button><button class="sn-button sn-secondary" data-export="opportunities">导出全部商机</button></div>
+          <p class="sn-helper">CSV 使用 UTF-8 BOM。公式型内容会加文本前缀，数据库原文不变；下载适合表格复核，不替代数据库备份，也不保证重新导入时逐字一致。</p><p class="sn-helper" id="export-feedback" role="status" aria-live="polite"></p>
+        </section>
+        <section class="sn-lower-section" aria-labelledby="audit-title">
+          <div class="sn-section-heading"><h2 id="audit-title">审计日志</h2><button class="sn-button sn-secondary" id="load-audit" type="button">加载最近记录</button></div>
+          <p class="sn-helper">记录业务写入、状态变更、导出与来源读取。仅显示当前工作空间，不包含密码、Cookie 或页面正文。</p>
+          <div id="audit-list"><p class="sn-muted">尚未加载审计记录。</p></div>
+        </section>
+        <div class="sn-note"><h2>当前版本范围</h2><p>支持工厂档案、品牌产品/SKU 与证据、品牌池研究任务、人工商机审核、联系人、销售记录、跟进待办、去重漏斗及人工草稿版本审批。自动发现来源、AI 分析与 AI 生成仍待后续接入。</p><p>这是单人本地工作空间，数据保存在本机；已启用本地负责人登录，团队权限和多租户隔离尚未开放，请勿部署到公网。</p></div>
+      </section>
+    </main>
+    <footer class="sn-footer"><span>Botein</span><span>本地开发版 · 数据保存在本机</span></footer>
+  </div>
+  <dialog aria-label="新增品牌" id="account-dialog" class="sn-dialog"><form id="account-form">
+    <div class="sn-dialog-heading"><h2>新增品牌</h2><button type="button" class="sn-close" data-close aria-label="关闭新增品牌">×</button></div>
+    <label class="sn-field">品牌名称<input name="brand_name" maxlength="100" required></label>
+    <label class="sn-field">官网<input name="website" type="url" placeholder="https://brand.com" required></label>
+    <label class="sn-field">总部国家代码<input name="headquarters_country" maxlength="2" pattern="[A-Za-z]{2}" placeholder="例如 US，未知留空"><span class="sn-helper">总部所在地不等于销售市场。</span></label>
+    <label class="sn-field">备注<textarea name="notes" rows="3" maxlength="2000"></textarea></label>
+    <p class="sn-form-error" role="alert" hidden></p><button class="sn-button" type="submit">保存品牌</button>
+  </form></dialog>
+  <dialog aria-label="导入品牌 CSV" id="import-dialog" class="sn-dialog"><form id="import-form">
+    <div class="sn-dialog-heading"><h2>导入品牌 CSV</h2><button type="button" class="sn-close" data-close aria-label="关闭导入">×</button></div>
+    <p class="sn-muted">UTF-8 编码，最多 500 行。重复品牌跳过，同域名多品牌会提示人工核对。</p>
+    <p class="sn-helper">必需列：brand_name、website。可选列：headquarters_country、notes。</p>
+    <label class="sn-field">选择文件<input type="file" name="file" accept=".csv,text/csv" required></label>
+    <p class="sn-form-error" role="alert" hidden></p><button class="sn-button" type="submit">导入并查看结果</button>
+    <div id="import-results" class="sn-import-results" aria-live="polite"></div>
+  </form></dialog>
+  <dialog aria-label="记录证据" id="evidence-dialog" class="sn-dialog"><form id="evidence-form">
+    <div class="sn-dialog-heading"><h2>记录原始证据</h2><button type="button" class="sn-close" data-close aria-label="关闭证据录入">×</button></div>
+    <label class="sn-field">所属品牌<select name="account_id" required></select></label>
+    <label class="sn-field">关联产品（可选）<select name="product_id"><option value="">品牌层级，具体产品未确认</option></select><span class="sn-helper" id="evidence-product-hint">产品必须属于所选品牌。未知 SKU 可留空，先在品牌池管理产品。</span></label>
+    <label class="sn-field">来源治理（可选）<select name="source_id"><option value="">不关联来源治理</option></select><span class="sn-helper">仅已启用来源可关联；目标域名必须在来源允许范围内。</span></label>
+    <label class="sn-field">来源网址<input name="source_url" type="url" placeholder="https://…"><span class="sn-helper">仅保存链接，不自动访问。无来源的文本仍可保存为待核验。</span></label>
+    <div class="sn-actions"><button class="sn-button sn-secondary" type="button" id="fetch-source-page">读取公开页面</button><span id="fetch-source-status" class="sn-helper" role="status" aria-live="polite">仅在点击时由本机访问一次；不自动抓取，读取后仍需人工核对。</span></div>
+    <label class="sn-field">原始发布时间<input name="published_at" type="date"><span class="sn-helper">未知留空，系统另行记录本次观察时间。</span></label>
+    <label class="sn-field">原始文本<textarea name="raw_text" rows="6" maxlength="20000" required placeholder="粘贴页面原文，保留上下文…"></textarea></label>
+    <p class="sn-form-error" role="alert" hidden></p><button class="sn-button" type="submit">保存待核验证据</button>
+  </form></dialog>
+  <dialog aria-label="登记研究来源" id="source-dialog" class="sn-dialog"><form id="source-form">
+    <div class="sn-dialog-heading"><h2>登记研究来源</h2><button type="button" class="sn-close" data-close aria-label="关闭来源登记">×</button></div>
+    <label class="sn-field">来源名称<input name="name" maxlength="100" required placeholder="例如：公开搜索 API / 品牌官网"></label>
+    <label class="sn-field">来源类型<select name="kind"><option value="AUTO_DISCOVERY">自动发现来源</option><option value="USER_PROVIDED_URL">用户提供网址</option></select></label>
+    <label class="sn-field">允许的域名<textarea name="base_domains" rows="2" maxlength="2000" required placeholder="example.com&#10;api.example.com"></textarea><span class="sn-helper">每行或逗号分隔，不含协议、端口或路径；最多 20 个。</span></label>
+    <label class="sn-field">每 15 分钟请求上限<input name="rate_limit_per_15m" type="number" min="1" max="120" value="20" required><span class="sn-helper">首版市场为美国，品类为洗衣凝珠。</span></label>
+    <label class="sn-field">使用方式与授权记录<textarea name="usage_note" rows="3" maxlength="2000" required placeholder="例如：已核对公开搜索 API 的服务条款允许品牌发现，记录日期与凭据编号；不抓取登录后内容。"></textarea></label>
+    <label class="sn-field">原始内容保留方式<textarea name="retention_note" rows="2" maxlength="2000" required placeholder="例如：仅保存来源 URL 与引用片段；收到删除请求时清理正文并保留审计。"></textarea></label>
+    <p class="sn-form-error" role="alert" hidden></p><button class="sn-button" type="submit">保存为待启用</button>
+  </form></dialog>
+  <dialog aria-label="添加商机" id="opportunity-dialog" class="sn-dialog"><form id="opportunity-form">
+    <div class="sn-dialog-heading"><h2>添加品牌到商机</h2><button type="button" class="sn-close" data-close aria-label="关闭商机录入">×</button></div>
+    <label class="sn-field">品牌<select name="account_id" required></select></label>
+    <p class="sn-helper">首发品类为洗衣凝珠。同一品牌的不同产品和事件复用同一个商机，不自动恢复已拒绝或归档记录。</p>
+    <label class="sn-field">开发理由<textarea name="reason" rows="3" required maxlength="2000" placeholder="说明为什么值得进一步了解，审核时需关联支持证据。"></textarea></label>
+    <p class="sn-form-error" role="alert" hidden></p><button type="submit" class="sn-button">保存待审核商机</button>
+  </form></dialog>
+  <dialog aria-label="审核商机" id="opportunity-review-dialog" class="sn-dialog sn-wide-dialog"><form id="opportunity-review-form">
+    <div class="sn-dialog-heading"><h2>审核商机</h2><button type="button" class="sn-close" data-close aria-label="关闭商机审核">×</button></div>
+    <label class="sn-field">审核操作<select name="action" required></select></label>
+    <label class="sn-field">理由或需补充的资料<textarea name="reason" rows="3" required maxlength="2000"></textarea></label>
+    <div id="qualify-fields" hidden>
+      <label class="sn-field">品牌洗衣凝珠产品证据<select name="product_evidence_id"></select></label>
+      <label class="sn-field">美国当前在售证据<select name="market_evidence_id"></select></label>
+      <label class="sn-field">支持开发理由的证据<select name="reason_evidence_id"></select></label>
+      <p class="sn-helper">仅展示本品牌已核验的证据，同一来源可支持多个事实。核验来源不代表产品问题或采购意向已被证实。</p>
+      <label class="sn-field">仍待确认的订单条件<textarea name="pending_info" rows="2" maxlength="2000" placeholder="例如采购量、MOQ 单位换算、包装和交期待确认。"></textarea></label>
+      <label class="sn-check"><input type="checkbox" name="no_known_conflict">已核对工厂能力，未发现明确的品类、市场或订单条件冲突。</label>
+      <label class="sn-check"><input type="checkbox" name="facts_confirmed">所选原文分别支持产品归属、美国在售及开发理由，值得首次联系。</label>
+    </div>
+    <p class="sn-form-error" role="alert" hidden></p><button type="submit" class="sn-button">保存审核结果</button>
+  </form></dialog>
+  <dialog aria-label="核对记录" id="record-action-dialog" class="sn-dialog"><form id="record-action-form">
+    <div class="sn-dialog-heading"><h2 id="record-action-title">核对记录</h2><button type="button" class="sn-close" data-close aria-label="关闭核对记录">×</button></div>
+    <div id="record-action-context" class="sn-action-context"></div>
+    <label class="sn-field">核对说明或原因<textarea name="reason" required rows="3" maxlength="1000"></textarea></label>
+    <label id="record-confirmation" class="sn-check"><input type="checkbox" name="confirmed"><span></span></label>
+    <p class="sn-form-error" role="alert" hidden></p><button type="submit" class="sn-button">确认保存</button>
+  </form></dialog>
+  <dialog aria-label="添加联系人" id="contact-dialog" class="sn-dialog"><form id="contact-form">
+    <div class="sn-dialog-heading"><h2>添加联系人</h2><button type="button" class="sn-close" data-close aria-label="关闭联系人录入">×</button></div>
+    <label class="sn-field">姓名或职能称呼<input name="full_name" required maxlength="100" placeholder="未知个人姓名时可填采购团队"></label>
+    <label class="sn-field">职位 / 职能<input name="job_title" maxlength="100"></label>
+    <label class="sn-field">商务邮箱<input name="email" type="email" required maxlength="254"></label>
+    <label class="sn-field">公开来源<input name="source_url" type="url" required placeholder="https://…"></label>
+    <p class="sn-helper">先保存为待核验，核对身份和渠道后才能标记可用。不会发送邮件或验证投递。</p>
+    <p class="sn-form-error" role="alert" hidden></p><button type="submit" class="sn-button">保存联系人</button>
+  </form></dialog>
+  <dialog aria-label="记录销售活动" id="activity-dialog" class="sn-dialog"><form id="activity-form">
+    <div class="sn-dialog-heading"><h2>记录实际销售活动</h2><button type="button" class="sn-close" data-close aria-label="关闭销售活动录入">×</button></div>
+    <label class="sn-field">活动类型<select name="activity_type">
+      <option value="EMAIL_SENT">已人工发送邮件</option><option value="REPLY_RECEIVED">收到回复</option><option value="MEETING_SCHEDULED">已安排会议</option><option value="SAMPLE_REQUESTED">收到样品请求</option><option value="SAMPLE_SENT">已寄出样品</option><option value="QUOTATION_SENT">已报价</option><option value="FOLLOW_UP">跟进记录</option><option value="DEAL_WON">已成交</option><option value="DEAL_LOST">已丢单</option>
+    </select></label>
+    <label class="sn-field">联系人<select name="contact_id"></select></label>
+    <label class="sn-field" id="activity-draft-field">实际使用的草稿版本<select name="draft_version_id"><option value="">外部自行撰写 / 未关联</option></select><span class="sn-helper">历史版本可补记，后续失效不会删除发送历史。</span></label>
+    <label class="sn-field">实际发生时间<input name="occurred_at" type="datetime-local" required><span class="sn-helper">可补录历史。会议活动记录安排发生的时间，不是未来会议时间。</span></label>
+    <label class="sn-field" id="reply-fields" hidden>回复性质<select name="reply_sentiment"><option value="UNKNOWN">待判断</option><option value="POSITIVE">正向，愿意继续讨论</option><option value="NEUTRAL">中性</option><option value="NEGATIVE">拒绝或退订</option></select></label>
+    <div id="deal-fields" class="sn-form-row" hidden><label class="sn-field">成交金额<input name="amount" type="number" min="0" max="9999999999" step="0.01" placeholder="未知留空"></label><label class="sn-field">币种<select name="currency"><option value="USD">USD</option><option value="CNY">CNY</option><option value="EUR">EUR</option></select></label></div>
+    <label class="sn-field">备注 / 丢单原因<textarea name="notes" rows="3" maxlength="2000"></textarea></label>
+    <label id="sent-confirmation" class="sn-check"><input name="sent_confirmed" type="checkbox">我已在外部邮箱实际发送，此处仅记录结果。</label>
+    <p class="sn-helper">历史活动可以补录，包括已失效或禁止联系的渠道；记录不会恢复联系人状态或执行任何外部触达。</p>
+    <p class="sn-form-error" role="alert" hidden></p><button type="submit" class="sn-button">保存活动记录</button>
+  </form></dialog>
+  <dialog aria-label="跟进待办" id="followup-dialog" class="sn-dialog"><form id="followup-form">
+    <div class="sn-dialog-heading"><h2 id="followup-form-title">新增跟进待办</h2><button type="button" class="sn-close" data-close aria-label="关闭待办">×</button></div>
+    <label class="sn-field">关联商机<select name="opportunity_id" required></select></label>
+    <label class="sn-field">下一步要做什么<input name="title" required maxlength="160" placeholder="例如：确认试样规格与数量"></label>
+    <label class="sn-field">截止时间<input name="due_at" type="datetime-local" required><span class="sn-helper">使用当前浏览器时区，允许补记已逾期事项。</span></label>
+    <label class="sn-field">备注<textarea name="notes" rows="3" maxlength="2000"></textarea></label>
+    <label class="sn-field" id="followup-status-field" hidden>状态<select name="status"><option value="OPEN">待处理</option><option value="DONE">已完成</option><option value="CANCELLED">已取消</option></select></label>
+    <label class="sn-field" id="followup-reason-field" hidden>完成、取消或重新开启的说明<textarea name="reason" rows="2" maxlength="1000"></textarea></label>
+    <p class="sn-helper">负责人：本地负责人。保存待办不会自动发送消息或新增销售活动。</p>
+    <p class="sn-form-error" role="alert" hidden></p><button type="submit" class="sn-button">保存待办</button>
+  </form></dialog>
+  <dialog id="capability-dialog" class="sn-dialog" aria-label="核验工厂能力"><form id="capability-form">
+    <div class="sn-dialog-heading"><h2>核验可对外引用的能力</h2><button type="button" class="sn-close" data-close aria-label="关闭能力核验">×</button></div>
+    <label class="sn-field">能力字段<select name="field" required></select></label>
+    <p id="capability-value" class="sn-result-note"></p>
+    <label class="sn-field">核验依据与适用条件<textarea name="reason" required maxlength="1500" rows="4" placeholder="说明实际能力、配方或包装条件及核对依据。"></textarea></label>
+    <label class="sn-check"><input name="confirmed" type="checkbox" required>我作为工厂负责人，已核对本版本的该项能力及适用条件。</label>
+    <p class="sn-form-error" role="alert" hidden></p><button type="submit" class="sn-button">保存字段核验</button>
+  </form></dialog>
+  <dialog id="draft-editor-dialog" class="sn-dialog sn-wide-dialog" aria-label="编辑英文草稿"><form id="draft-editor-form">
+    <div class="sn-dialog-heading"><h2>人工英文草稿</h2><button type="button" class="sn-close" data-close aria-label="关闭草稿编辑">×</button></div>
+    <p class="sn-helper">模型尚未接入。请填写自己的草稿并标出事实原句；每次保存编辑都会产生新版本并撤销旧批准。</p>
+    <label class="sn-field">目标联系人<select name="contact_id" required></select></label>
+    <label class="sn-field">英文主题<input name="subject" maxlength="200" required></label>
+    <label class="sn-field">英文正文<textarea name="body" rows="8" maxlength="10000" required></textarea></label>
+    <div class="sn-section-heading"><h3>事实陈述及支持依据</h3><button type="button" class="sn-button sn-secondary" id="add-draft-claim">添加事实陈述</button></div>
+    <p class="sn-helper">复制主题或正文中的事实原句；问候、提问无需引用。引用关系由系统检查，是否遗漏、夸大或暗示采购意向仍需人工核对。</p>
+    <div id="draft-claim-rows"></div>
+    <p class="sn-form-error" role="alert" hidden></p><button type="submit" class="sn-button">保存新草稿版本</button>
+  </form></dialog>
+  <dialog id="draft-review-dialog" class="sn-dialog sn-wide-dialog" aria-label="审核草稿"><form id="draft-review-form">
+    <div class="sn-dialog-heading"><h2>逐版本人工审核</h2><button type="button" class="sn-close" data-close aria-label="关闭草稿审核">×</button></div>
+    <div id="draft-review-preview"></div>
+    <label class="sn-field">结论<select name="action"><option value="APPROVE">批准此版本</option><option value="REJECT">拒绝此版本</option></select></label>
+    <label class="sn-field">审核说明<textarea name="reason" maxlength="1500" rows="3" required></textarea></label>
+    <div id="draft-approval-checks"><label class="sn-check"><input name="full_text_confirmed" type="checkbox" required>已核对主题和全文，所有事实陈述均已标出；无虚构认证、采购意向、供应商责任或夸大结论。</label><label class="sn-check"><input name="claims_confirmed" type="checkbox" required>每条陈述的含义和适用范围均受所引用的原文或工厂字段支持，时效性声明已正确标记。</label></div>
+    <p class="sn-form-error" role="alert" hidden></p><button type="submit" class="sn-button">保存审核结论</button>
+  </form></dialog>
+  <dialog id="products-dialog" class="sn-dialog sn-wide-dialog" aria-label="品牌产品管理">
+    <div class="sn-dialog-heading"><h2 id="products-title">品牌产品</h2><button type="button" class="sn-close" data-close aria-label="关闭产品管理">×</button></div>
+    <p class="sn-helper">记录品牌产品、平台 SKU 与原始链接，不自动判定在售或采购意向。首发范围为洗衣凝珠。</p>
+    <div class="sn-actions"><button class="sn-button" id="new-product" type="button">新增产品</button></div>
+    <div id="products-list" aria-live="polite"></div>
+  </dialog>
+  <dialog id="product-editor-dialog" class="sn-dialog sn-wide-dialog" aria-label="编辑品牌产品"><form id="product-editor-form">
+    <div class="sn-dialog-heading"><h2 id="product-editor-title">新增品牌产品</h2><button type="button" class="sn-close" data-close aria-label="关闭产品编辑">×</button></div>
+    <label class="sn-field">产品名称<input name="product_name" required maxlength="200"></label>
+    <label class="sn-field">品类<select name="product_category"><option value="LAUNDRY_PODS">洗衣凝珠（首发范围）</option><option value="DISHWASHER_TABLETS">洗碗块（范围外）</option><option value="OTHER">其他品类（范围外）</option><option value="UNKNOWN">待确认品类</option></select></label>
+    <label class="sn-field">产品原始链接<input name="product_url" type="url" required maxlength="2000" placeholder="https://…"><span class="sn-helper">完整保存原始链接；只保存资料，不在服务端自动访问。</span></label>
+    <div class="sn-form-row"><label class="sn-field">平台 SKU / 产品编号<input name="external_sku" maxlength="120" placeholder="未知留空"></label><label class="sn-field">SKU 所属平台<input name="marketplace" maxlength="100" placeholder="例如官网、Amazon"></label></div>
+    <label class="sn-field">包装规格<input name="packaging_type" maxlength="300" placeholder="例如 30 粒/袋，未知留空"></label>
+    <label class="sn-field">备注<textarea name="notes" rows="2" maxlength="2000"></textarea></label>
+    <label class="sn-field">资料状态<select name="status"><option value="ACTIVE">保留在产品列表</option><option value="ARCHIVED">归档（不再新增关联）</option></select><span class="sn-helper">资料状态不等于产品在售状态。</span></label>
+    <label class="sn-field" id="product-change-reason" hidden>修改原因<textarea name="reason" rows="2" maxlength="1000"></textarea></label>
+    <p class="sn-helper">修改产品核心资料或归档后，关联证据需重新核验；依赖它的合格商机转为待重评，草稿批准失效。仅改备注不影响核验。</p>
+    <p class="sn-form-error" role="alert" hidden></p><button class="sn-button" type="submit">保存产品</button>
+  </form></dialog>
+  <dialog id="evidence-product-dialog" class="sn-dialog" aria-label="修订证据产品归属"><form id="evidence-product-form">
+    <div class="sn-dialog-heading"><h2>修订产品归属</h2><button type="button" class="sn-close" data-close aria-label="关闭归属修订">×</button></div>
+    <div id="evidence-product-preview" class="sn-action-context"></div>
+    <label class="sn-field">关联产品<select name="product_id"></select></label>
+    <label class="sn-field">修订原因<textarea name="reason" required rows="3" maxlength="1000"></textarea></label>
+    <p class="sn-helper">保留原文和旧核验历史，修订后需要重新核验；撤销相关商机和草稿的当前批准。</p>
+    <p class="sn-form-error" role="alert" hidden></p><button class="sn-button" type="submit">保存归属并重新核验</button>
+  </form></dialog>
+  <dialog id="evidence-import-dialog" class="sn-dialog sn-wide-dialog" aria-label="导入证据 CSV"><form id="evidence-import-form">
+    <div class="sn-dialog-heading"><h2>导入原始证据 CSV</h2><button type="button" class="sn-close" data-close aria-label="关闭证据导入">×</button></div>
+    <p class="sn-helper">先录入品牌，再从下方列表或品牌导出文件取得 account_id。产品可留空，填写 product_id 时必须属于同一品牌。</p>
+    <div class="sn-actions"><button type="button" class="sn-button sn-secondary" id="evidence-template">下载空白模板</button><button type="button" class="sn-button sn-secondary" data-export="accounts">导出品牌 ID</button><button type="button" class="sn-button sn-secondary" data-export="products">导出产品 ID</button></div>
+    <details class="sn-history-details"><summary>当前品牌与 ID</summary><div id="import-account-reference"></div></details>
+    <p class="sn-helper">必需列：account_id、source_url、raw_text、observed_at。source_url 内容可为空；observed_at 必须是过去的 UTC 时间，如 2026-11-12T08:00:00Z。可选列：product_id、published_at（YYYY-MM-DD）。</p>
+    <p class="sn-helper">每行代表一条证据。引号内可包含换行；行号是包含表头的逻辑记录序号。额外核验状态列不会升级记录，已存在证据的原状态保留。</p>
+    <label class="sn-field">CSV 文件（UTF-8，不超过 500 KB）<input name="file" type="file" accept=".csv,text/csv" required></label>
+    <p class="sn-form-error" role="alert" hidden></p><button class="sn-button" type="submit">导入并查看逐行结果</button>
+    <div id="evidence-import-results" class="sn-import-results" role="status" aria-live="polite"></div>
+  </form></dialog>
+  <dialog id="account-edit-dialog" class="sn-dialog sn-wide-dialog" aria-label="编辑品牌资料"><form id="account-edit-form">
+    <div class="sn-dialog-heading"><h2>编辑品牌资料</h2><button type="button" class="sn-close" data-close aria-label="关闭品牌编辑">×</button></div>
+    <label class="sn-field">品牌名称<input name="brand_name" required maxlength="100"></label>
+    <label class="sn-field">官网<input name="website" type="url" required></label>
+    <label class="sn-field">总部国家代码<input name="headquarters_country" maxlength="2" pattern="[A-Za-z]{2}" placeholder="未知留空"></label>
+    <label class="sn-field">备注<textarea name="notes" rows="3" maxlength="2000"></textarea></label>
+    <label class="sn-field">修改原因<textarea name="reason" rows="2" required maxlength="1500"></textarea></label>
+    <label class="sn-check"><input name="shared_domain_confirmed" type="checkbox">如新名称或官网与其他品牌共域名，我已确认它是独立品牌。</label>
+    <p class="sn-helper">修改品牌名称或官网会使相关证据重新核验、联系人需重核，并撤销依赖的商机和草稿批准。只改总部国家或备注不影响当前核验。不会移动产品或合并品牌。</p>
+    <p class="sn-form-error" role="alert" hidden></p><button class="sn-button" type="submit">保存品牌修改</button>
+    <details class="sn-history-details"><summary>品牌变更历史</summary><div id="account-edit-history"></div></details>
+  </form></dialog>
+  <dialog id="identity-dialog" class="sn-dialog sn-wide-dialog" aria-label="核对同域名品牌"><form id="identity-form">
+    <div class="sn-dialog-heading"><h2>核对品牌身份</h2><button type="button" class="sn-close" data-close aria-label="关闭品牌身份核对">×</button></div>
+    <div id="identity-preview" class="sn-action-context"></div>
+    <label class="sn-field">结论<select name="action"></select></label>
+    <label class="sn-field" id="identity-target-field">复用哪个现有品牌<select name="target_account_id"></select></label>
+    <label class="sn-field">判断依据与原因<textarea name="reason" required maxlength="1500" rows="3"></textarea></label>
+    <label class="sn-check" id="identity-confirm-field"><input type="checkbox" name="confirmed">已打开官网核对品牌归属，确认上述身份判断。</label>
+    <p class="sn-helper">复用不会覆盖现有资料；确认独立只新增本候选品牌；排除后重复导入会跳过，可重新开启核对。当前本地负责人执行此操作。</p>
+    <p class="sn-form-error" role="alert" hidden></p><button type="submit" class="sn-button">保存身份结论</button>
+  </form></dialog>
+  <dialog id="contact-directory-dialog" class="sn-dialog sn-wide-dialog" aria-label="联系人资料与禁止联系记录">
+    <div class="sn-dialog-heading"><h2>联系人资料</h2><button type="button" class="sn-close" data-close aria-label="关闭联系人目录">×</button></div>
+    <label class="sn-field">搜索姓名、品牌或邮箱<input id="contact-directory-filter" type="search"></label>
+    <div id="contact-directory-list" aria-live="polite"></div><h3>组织级禁止联系记录</h3><p class="sn-helper">此列表仅供查看，不提供一键解除；不会发送任何消息。</p><div id="contact-suppressions-list"></div>
+  </dialog>
+  <dialog id="contact-edit-dialog" class="sn-dialog sn-wide-dialog" aria-label="编辑联系人资料"><form id="contact-edit-form">
+    <div class="sn-dialog-heading"><h2>编辑联系人资料</h2><button type="button" class="sn-close" data-close aria-label="关闭联系人编辑">×</button></div>
+    <p id="contact-edit-context" class="sn-result-note"></p>
+    <label class="sn-field">姓名或职能称呼<input name="full_name" required maxlength="100"></label>
+    <label class="sn-field">职位 / 职能<input name="job_title" maxlength="100"></label>
+    <label class="sn-field">商务邮箱（固定渠道）<input name="email" type="email" readonly><span class="sn-helper">换邮箱请新增联系人，旧渠道与禁止联系记录保留。</span></label>
+    <label class="sn-field">公开来源<input name="source_url" type="url" required></label>
+    <label class="sn-field">修改原因<textarea name="reason" required rows="3" maxlength="1500"></textarea></label>
+    <p class="sn-helper">身份或来源变化后需要重新核验，已批准草稿会失效。过去的草稿和活动保留录入时的联系人快照。</p>
+    <p class="sn-form-error" role="alert" hidden></p><button class="sn-button" type="submit">保存联系人修改</button>
+    <details class="sn-history-details"><summary>联系人变更与核验历史</summary><div id="contact-edit-history"></div></details>
+  </form></dialog>
+  <dialog id="password-dialog" class="sn-dialog" aria-label="修改负责人密码"><form id="password-form">
+    <div class="sn-dialog-heading"><h2>修改负责人密码</h2><button type="button" class="sn-close" data-close aria-label="关闭密码修改">×</button></div>
+    <input name="username" type="text" autocomplete="username" hidden>
+    <label class="sn-field">当前密码<input name="current_password" type="password" autocomplete="current-password" required></label>
+    <label class="sn-field">新密码<input name="new_password" type="password" autocomplete="new-password" minlength="8" required><span class="sn-helper">至少 8 个字符，UTF-8 长度不超过 256 字节。</span></label>
+    <label class="sn-field">确认新密码<input name="confirm_password" type="password" autocomplete="new-password" required></label>
+    <p class="sn-helper">修改成功后，其他浏览器会话立即失效，本窗口保持登录。已有资料和审批记录不受影响。</p>
+    <p class="sn-form-error" role="alert" hidden></p><button class="sn-button" type="submit">保存新密码</button>
+  </form></dialog>
+  <dialog id="sessions-dialog" class="sn-dialog sn-wide-dialog" aria-label="有效登录会话">
+    <div class="sn-dialog-heading"><h2>有效登录</h2><button type="button" class="sn-close" data-close aria-label="关闭登录列表">×</button></div>
+    <p class="sn-helper">显示尚未过期且未撤销的登录，不表示浏览器当前在线。不采集设备型号、IP 或位置；相同浏览器的多个标签页可能共用一个登录。</p>
+    <div class="sn-actions"><button id="refresh-sessions" class="sn-button sn-secondary" type="button">刷新列表</button><button id="revoke-other-sessions" class="sn-button sn-secondary" type="button" disabled>退出其他会话</button></div>
+    <p id="sessions-feedback" class="sn-helper" role="status" aria-live="polite"></p>
+    <div id="sessions-list" aria-live="polite"></div>
+    <p class="sn-helper">撤销即时在服务端生效；其他浏览器在下次请求或焦点检查时返回登录。已保存数据保留，未保存输入可能丢失。</p>
+  </dialog>
+</body>
+</html>
