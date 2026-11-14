@@ -166,6 +166,7 @@
 .sn-report-inputs { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr) minmax(0,1.3fr) auto; align-items: start; gap: 20px; }
 .sn-report-inputs .sn-button { margin-top: 29px; }
 .sn-report-inputs .sn-field { margin-bottom: 0; }
+.sn-analysis:not(:empty) { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--vbg-border-strong); }
 .sn-next-actions { margin: 8px 0 0; padding-left: 20px; color: var(--vbg-text-secondary); font-size: var(--vbg-type-compact); }
 .sn-next-actions li { margin: 4px 0; }
 .sn-audit-details { max-width: 520px; }

@@ -93,8 +93,11 @@ export function salesApi(db, path, method, body, query) {
         db.prepare(`UPDATE evidence SET raw_text='',verification_status='INVALIDATED',checked_at=NULL,verification_note='',
           purged_at=?,purge_reason=?,version=version+1 WHERE id=? AND organization_id=?`).run(now, reason, id, ORG);
         const redacted = redactEvidenceQuotes(db, id);
+        const assessmentsRedacted = db.prepare(`UPDATE signal_assessments
+          SET observed_facts='[]',business_hypotheses='[]',missing_information='[]'
+          WHERE organization_id=? AND evidence_id=?`).run(ORG, id).changes;
         reassessQualified(db, `证据原文已按保留政策清除：${reason}`, id);
-        audit(db, 'EVIDENCE_PURGED', id, { reason, purged_at: now, previous_status: row.verification_status, previous_version: row.version, quotes_redacted: redacted });
+        audit(db, 'EVIDENCE_PURGED', id, { reason, purged_at: now, previous_status: row.verification_status, previous_version: row.version, quotes_redacted: redacted, assessments_redacted: assessmentsRedacted });
         reconcileApprovals(db);
         return { status: 200, body: evidence(db, id) };
       }

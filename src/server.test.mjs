@@ -44,6 +44,15 @@ async function runApp(databasePath, { authenticate = true, services = offlineSer
     close: async () => { await new Promise(resolve => app.server.close(resolve)); app.db.close(); },
   };
 }
+async function waitForJob(app, id, timeout = 8000) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const job = (await app.request(`/research-jobs/${id}`)).body;
+    if (['COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED'].includes(job.status)) return job;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error(`research job ${id} did not finish`);
+}
 
 test('local main path: factory version → activation → CSV brands → raw evidence survives restart', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'botein-'));
@@ -692,14 +701,16 @@ test('pool research: deterministic tiers reuse manual opportunities and never au
     const dish = (await app.request('/accounts', 'POST', { brand_name: 'Dish Brand', website: 'https://dish.example.com' })).body;
     await app.request(`/accounts/${dish.id}/products`, 'POST', { product_name: 'Dish tabs', product_category: 'DISHWASHER_TABLETS', product_url: 'https://dish.example.com/tabs' });
 
-    const job = await app.request('/research-jobs', 'POST', { market: 'US', source_mode: 'POOL', quantity: 20 }, { 'Idempotency-Key': 'pool-once' });
-    assert.equal(job.status, 202, JSON.stringify(job.body));
-    assert.equal(job.body.status, 'COMPLETED'); assert.equal(job.body.input.source_mode, 'POOL');
-    assert.equal(job.body.counts.discovered, 3); assert.equal(job.body.counts.new_opportunities, 0);
-    assert.equal(job.body.counts.reused_opportunities, 1); assert.equal(job.body.counts.not_fit, 1);
-    assert.equal(job.body.stop_reason, 'SOURCE_SCOPE_EXHAUSTED'); assert.equal(job.body.budget.usage.search_requests, 0);
+    const created = await app.request('/research-jobs', 'POST', { market: 'US', source_mode: 'POOL', quantity: 20 }, { 'Idempotency-Key': 'pool-once' });
+    assert.equal(created.status, 202, JSON.stringify(created.body));
+    assert.ok(['QUEUED', 'RUNNING', 'COMPLETED'].includes(created.body.status));
+    const job = await waitForJob(app, created.body.id);
+    assert.equal(job.status, 'COMPLETED'); assert.equal(job.input.source_mode, 'POOL');
+    assert.equal(job.counts.discovered, 3); assert.equal(job.counts.new_opportunities, 0);
+    assert.equal(job.counts.reused_opportunities, 1); assert.equal(job.counts.not_fit, 1);
+    assert.equal(job.stop_reason, 'SOURCE_SCOPE_EXHAUSTED'); assert.equal(job.budget.usage.search_requests, 0);
 
-    const results = (await app.request(`/research-jobs/${job.body.id}/results`)).body;
+    const results = (await app.request(`/research-jobs/${job.id}/results`)).body;
     const byBrand = Object.fromEntries(results.items.map(row => [row.brand_name, row]));
     assert.equal(byBrand['Pod Brand'].tier, 'PRIORITY_REVIEW');
     assert.equal(byBrand['Pod Brand'].opportunity_id, item.id);
@@ -717,7 +728,8 @@ test('pool research: deterministic tiers reuse manual opportunities and never au
     assert.deepEqual(byBrand['Dish Brand'].next_actions, ['已列入排除记录，无需跟进。']);
     assert.equal(results.counts.returned, 2); assert.equal(results.counts.not_fit, 1);
 
-    const high = (await app.request('/research-jobs', 'POST', { market: 'US', source_mode: 'POOL', min_evidence_quality: 'HIGH' })).body;
+    const highCreated = await app.request('/research-jobs', 'POST', { market: 'US', source_mode: 'POOL', min_evidence_quality: 'HIGH' });
+    const high = await waitForJob(app, highCreated.body.id);
     const highResults = (await app.request(`/research-jobs/${high.id}/results`)).body;
     const highPod = highResults.items.find(row => row.brand_name === 'Pod Brand');
     assert.equal(highPod.tier, 'NEEDS_INFORMATION');
@@ -725,17 +737,19 @@ test('pool research: deterministic tiers reuse manual opportunities and never au
     assert.equal(high.counts.reused_opportunities, 1);
 
     const replay = await app.request('/research-jobs', 'POST', { market: 'US', source_mode: 'POOL', quantity: 20 }, { 'Idempotency-Key': 'pool-once' });
-    assert.equal(replay.body.id, job.body.id); assert.equal(replay.body.replayed, true);
+    assert.equal(replay.body.id, job.id); assert.equal(replay.body.replayed, true);
     assert.equal((await app.request('/research-jobs', 'POST', { market: 'US', source_mode: 'POOL', quantity: 19 }, { 'Idempotency-Key': 'pool-once' })).status, 409);
     const jobList = (await app.request('/research-jobs')).body;
     assert.equal(jobList.items.length, 2); assert.equal(jobList.total, 2);
-    assert.deepEqual((await app.request(`/research-jobs/${job.body.id}/failures`)).body.items, []);
-    assert.equal((await app.request(`/research-jobs/${job.body.id}/retry`, 'POST', {})).status, 409);
-    app.db.prepare("UPDATE research_jobs SET status='FAILED',stop_reason='DEPENDENCY_FAILURE' WHERE id=?").run(job.body.id);
-    const retried = await app.request(`/research-jobs/${job.body.id}/retry`, 'POST', {});
-    assert.equal(retried.status, 202); assert.equal(retried.body.attempt, 2); assert.equal(retried.body.status, 'COMPLETED');
-    assert.equal((await app.request(`/research-jobs/${job.body.id}/results`)).body.items.length, 3);
-    assert.equal((await app.request(`/research-jobs/${job.body.id}/cancel`, 'POST', {})).body.status, 'COMPLETED');
+    assert.deepEqual((await app.request(`/research-jobs/${job.id}/failures`)).body.items, []);
+    assert.equal((await app.request(`/research-jobs/${job.id}/retry`, 'POST', {})).status, 409);
+    app.db.prepare("UPDATE research_jobs SET status='FAILED',stop_reason='DEPENDENCY_FAILURE' WHERE id=?").run(job.id);
+    const retried = await app.request(`/research-jobs/${job.id}/retry`, 'POST', {});
+    assert.equal(retried.status, 202); assert.equal(retried.body.attempt, 2);
+    const retriedJob = await waitForJob(app, job.id);
+    assert.equal(retriedJob.status, 'COMPLETED');
+    assert.equal((await app.request(`/research-jobs/${job.id}/results`)).body.items.length, 3);
+    assert.equal((await app.request(`/research-jobs/${job.id}/cancel`, 'POST', {})).body.status, 'COMPLETED');
   } finally { await app.close(); }
 });
 
@@ -982,6 +996,78 @@ test('source preview governance: domain scope, per-source limit and automatic di
   } finally { await app.close(); }
 });
 
+test('AI evidence analysis validates quotes, stores assessments and redacts on purge', async () => {
+  let calls = 0;
+  const services = {
+    ...offlineServices,
+    modelConfig: () => ({ configured: true, name: 'stub-model' }),
+    completeJson: async () => {
+      calls++;
+      if (calls === 1) return {
+        data: {
+          event_type: 'CLUMPING',
+          observed_facts: [{ text: 'A review reports pods sticking together.', references: [{ quote: 'Sample branded laundry pods offered in US.' }] }],
+          business_hypotheses: [{ type: 'POTENTIAL_PRODUCT_IMPROVEMENT_NEED', confidence_label: 'LOW', reason: 'A single review does not establish frequency.' }],
+          intent_signal: 'UNKNOWN', missing_information: ['Frequency baseline'], uncertainty: 'HIGH',
+        }, usage: { input_tokens: 80, output_tokens: 40, cost: 0.001 }, model: 'stub-model',
+      };
+      return {
+        data: {
+          event_type: 'CLUMPING',
+          observed_facts: [{ text: 'Fabricated fact.', references: [{ quote: 'not in the evidence text' }] }],
+          business_hypotheses: [], intent_signal: 'UNKNOWN', missing_information: [], uncertainty: 'HIGH',
+        }, usage: {}, model: 'stub-model',
+      };
+    },
+  };
+  const app = await runApp(':memory:', { services });
+  try {
+    const { proof } = await prepareDraft(app);
+    const analyzed = await app.request(`/evidence/${proof.id}/analyze`, 'POST', {});
+    assert.equal(analyzed.status, 201, JSON.stringify(analyzed.body));
+    assert.equal(analyzed.body.event_type, 'CLUMPING');
+    assert.equal(analyzed.body.evidence_quality, 'MEDIUM');
+    assert.equal(analyzed.body.observed_facts[0].references[0].quote, 'Sample branded laundry pods offered in US.');
+    assert.equal((await app.request(`/evidence/${proof.id}/assessments`)).body.items.length, 1);
+    const invalid = await app.request(`/evidence/${proof.id}/analyze`, 'POST', {});
+    assert.equal(invalid.status, 422); assert.equal(invalid.body.error.code, 'MODEL_ANALYSIS_VALIDATION_FAILED');
+    assert.equal((await app.request(`/evidence/${proof.id}/assessments`)).body.items.length, 1);
+    const purged = await app.request(`/evidence/${proof.id}/purge`, 'POST', { expected_version: 2, reason: '保留政策清除。', confirmed: true });
+    assert.equal(purged.status, 200);
+    const assessments = (await app.request(`/evidence/${proof.id}/assessments`)).body.items;
+    assert.equal(assessments.length, 1);
+    assert.deepEqual(assessments[0].observed_facts, []);
+    assert.deepEqual(assessments[0].business_hypotheses, []);
+    assert.equal(assessments[0].event_type, 'CLUMPING');
+  } finally { await app.close(); }
+});
+
+test('research cancellation stops a running discovery job without saving results', async () => {
+  const services = {
+    ...offlineServices,
+    searchStatus: async () => ({ configured: true, reachable: true, base: 'stub' }),
+    modelConfig: () => ({ configured: true, name: 'stub-model' }),
+    searchWeb: async () => { await new Promise(resolve => setTimeout(resolve, 300)); return []; },
+    completeJson: async () => ({ data: { candidates: [] }, usage: {}, model: 'stub-model' }),
+  };
+  const app = await runApp(':memory:', { services });
+  try {
+    const p = (await app.request('/workspace')).body.factory;
+    const saved = (await app.request('/factory-profile', 'PUT', { ...p, target_markets: ['US'], expected_version: p.version })).body;
+    await app.request('/factory-profile/activate', 'POST', { expected_version: saved.version, confirmed: true });
+    const created = await app.request('/research-jobs', 'POST', { market: 'US' });
+    assert.equal(created.status, 202, JSON.stringify(created.body));
+    const cancelled = await app.request(`/research-jobs/${created.body.id}/cancel`, 'POST', {});
+    assert.equal(cancelled.body.status, 'CANCELLED');
+    await new Promise(resolve => setTimeout(resolve, 600));
+    const job = (await app.request(`/research-jobs/${created.body.id}`)).body;
+    assert.equal(job.status, 'CANCELLED');
+    assert.equal(job.stop_reason, 'USER_CANCELLED');
+    assert.equal((await app.request(`/research-jobs/${created.body.id}/results`)).body.items.length, 0);
+    assert.equal((await app.request('/accounts')).body.items.length, 0);
+  } finally { await app.close(); }
+});
+
 test('AI draft generation validates claims and still requires human approval', async () => {
   let proofId = '', checkId = '', calls = 0;
   const services = {
@@ -1055,22 +1141,23 @@ test('discovery research uses search and model to create unverified candidates o
     const workspace = (await app.request('/workspace')).body;
     assert.equal(workspace.integrations.model.status, 'CONNECTED');
     assert.equal(workspace.integrations.search.status, 'CONNECTED');
-    const job = await app.request('/research-jobs', 'POST', { market: 'US', quantity: 10 });
-    assert.equal(job.status, 202, JSON.stringify(job.body));
-    assert.equal(job.body.status, 'COMPLETED');
-    assert.equal(job.body.counts.discovered, 1); assert.equal(job.body.counts.processed, 1);
-    assert.equal(job.body.counts.new_opportunities, 0);
-    assert.equal(job.body.details.model, 'stub-model');
+    const created = await app.request('/research-jobs', 'POST', { market: 'US', quantity: 10 });
+    assert.equal(created.status, 202, JSON.stringify(created.body));
+    const job = await waitForJob(app, created.body.id);
+    assert.equal(job.status, 'COMPLETED');
+    assert.equal(job.counts.discovered, 1); assert.equal(job.counts.processed, 1);
+    assert.equal(job.counts.new_opportunities, 0);
+    assert.equal(job.details.model, 'stub-model');
     const accounts = (await app.request('/accounts')).body.items;
     assert.equal(accounts.length, 1); assert.equal(accounts[0].brand_name, 'Acme Pods');
     const evidence = (await app.request('/evidence')).body.items;
     assert.equal(evidence.length, 1); assert.equal(evidence[0].verification_status, 'UNVERIFIED');
     assert.match(evidence[0].raw_text, /Laundry pods sold in the US/);
-    const results = (await app.request(`/research-jobs/${job.body.id}/results`)).body;
+    const results = (await app.request(`/research-jobs/${job.id}/results`)).body;
     assert.equal(results.items.length, 1); assert.equal(results.items[0].tier, 'NEEDS_INFORMATION');
     assert.equal(results.items[0].opportunity_id, null);
     assert.equal((await app.request('/opportunities')).body.items.length, 0);
-    assert.ok(Array.isArray((await app.request(`/research-jobs/${job.body.id}/failures`)).body.items));
+    assert.ok(Array.isArray((await app.request(`/research-jobs/${job.id}/failures`)).body.items));
   } finally { await app.close(); }
 });
 

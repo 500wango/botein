@@ -223,6 +223,17 @@ export function openStore(path) {
       db.exec(`ALTER TABLE draft_versions ADD COLUMN created_by TEXT NOT NULL DEFAULT 'MANUAL';
         PRAGMA user_version = 14;`);
     }
+    if (db.prepare('PRAGMA user_version').get().user_version < 15) {
+      db.exec(`CREATE TABLE signal_assessments (
+        id TEXT PRIMARY KEY, organization_id TEXT NOT NULL REFERENCES organizations(id),
+        evidence_id TEXT NOT NULL REFERENCES evidence(id), evidence_version INTEGER NOT NULL,
+        event_type TEXT NOT NULL, observed_facts TEXT NOT NULL, business_hypotheses TEXT NOT NULL,
+        intent_signal TEXT NOT NULL, uncertainty TEXT NOT NULL, evidence_quality TEXT NOT NULL,
+        quality_reason TEXT NOT NULL, missing_information TEXT NOT NULL,
+        model_version TEXT NOT NULL, prompt_version TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE INDEX signal_assessment_evidence ON signal_assessments(organization_id,evidence_id,created_at);
+        PRAGMA user_version = 15;`);
+    }
   });
   db.prepare('INSERT OR IGNORE INTO organizations VALUES (?, ?)').run(ORG, 'LANCCO 本地工作空间');
   db.prepare('INSERT OR IGNORE INTO factory_profiles VALUES (?, ?, ?, ?, ?)')

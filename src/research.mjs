@@ -200,11 +200,23 @@ function failJob(db, id, error) {
 }
 
 function step(db, id, value) {
-  db.prepare('UPDATE research_jobs SET current_step=?,version=version+1 WHERE id=? AND organization_id=?').run(value, id, ORG);
+  db.prepare("UPDATE research_jobs SET current_step=?,version=version+1 WHERE id=? AND organization_id=? AND status='RUNNING'").run(value, id, ORG);
+}
+
+function scheduleJob(db, id, input, services) {
+  setImmediate(() => {
+    const run = input.source_mode === 'DISCOVERY' ? runDiscovery : runPool;
+    Promise.resolve(run(db, id, input, services)).catch(error => {
+      try { transaction(db, () => failJob(db, id, error)); }
+      catch (nested) { console.error(`[research ${id}]`, nested.message); }
+    });
+  });
 }
 
 function runPool(db, id, input) {
   return transaction(db, () => {
+    const starting = jobRow(db, id);
+    if (starting.status === 'CANCELLED') return jobView(starting);
     const started = Date.now(), now = new Date().toISOString();
     db.prepare("UPDATE research_jobs SET status='RUNNING',current_step='DISCOVERING',started_at=COALESCE(started_at,?),version=version+1 WHERE id=? AND organization_id=?")
       .run(now, id, ORG);
@@ -249,14 +261,22 @@ function runPool(db, id, input) {
 }
 
 async function runDiscovery(db, id, input, services) {
+  const starting = jobRow(db, id);
+  if (starting.status === 'CANCELLED') return jobView(starting);
   const started = Date.now(), now = new Date().toISOString();
   db.prepare(`UPDATE research_jobs SET status='RUNNING',current_step='DISCOVERING',started_at=COALESCE(started_at,?),version=version+1
     WHERE id=? AND organization_id=?`).run(now, id, ORG);
   step(db, id, 'ENRICHING');
   let discovery;
   try {
-    discovery = await discover({ db, input, services });
+    discovery = await discover({
+      db, input, services,
+      shouldStop: () => jobRow(db, id).status === 'CANCELLED',
+      onStep: value => step(db, id, value),
+    });
   } catch (error) {
+    const current = jobRow(db, id);
+    if (current.status === 'CANCELLED') return jobView(current);
     transaction(db, () => {
       db.prepare('INSERT INTO research_job_failures VALUES (?,?,?,?,?,?,?)')
         .run(randomUUID(), ORG, id, null, 'DISCOVERY', error.message, new Date().toISOString());
@@ -265,6 +285,8 @@ async function runDiscovery(db, id, input, services) {
     throw error;
   }
   return transaction(db, () => {
+    const current = jobRow(db, id);
+    if (current.status === 'CANCELLED') return jobView(current);
     const factory = profile(db);
     const counts = {
       discovered: discovery.counts.discovered ?? 0, processed: 0,
@@ -350,7 +372,7 @@ export async function researchApi(db, path, method, body, query, services) {
         items: page.items.map(jobView), next_cursor: page.next_cursor, total,
         limitations: {
           discovery: '自动发现通过本地 SearXNG 搜索公开网页，并由模型筛选候选；搜索或模型不可用时返回 503，不产生空转任务。',
-          model: '模型用于候选筛选；商机详情可生成待审 AI 草稿；联系人自动发现与 AI 证据分析尚未接入。',
+          model: '模型用于候选筛选、证据信号分析和待审 AI 草稿；联系人自动发现尚未接入。',
           pool: 'POOL 仅分析本工作空间已保存的品牌、产品、证据和人工审核记录。',
         },
       },
@@ -390,15 +412,8 @@ export async function researchApi(db, path, method, body, query, services) {
       return { id };
     });
     if (created.replay) return { status: 202, body: { ...created.replay, replayed: true } };
-    try {
-      const body = input.source_mode === 'DISCOVERY'
-        ? await runDiscovery(db, created.id, input, services)
-        : runPool(db, created.id, input);
-      return { status: 202, body };
-    } catch (error) {
-      transaction(db, () => failJob(db, created.id, error));
-      throw error;
-    }
+    scheduleJob(db, created.id, input, services);
+    return { status: 202, body: { ...jobView(jobRow(db, created.id)), queued: true } };
   }
 
   if ((match = path.match(/^\/research-jobs\/([^/]+)\/cancel$/)) && method === 'POST') {
@@ -422,16 +437,8 @@ export async function researchApi(db, path, method, body, query, services) {
       audit(db, 'RESEARCH_JOB_RETRY', row.id, { attempt: row.attempt + 1 });
       return jobRow(db, row.id);
     });
-    try {
-      const input = JSON.parse(queued.input_snapshot);
-      const body = queued.source_mode === 'DISCOVERY'
-        ? await runDiscovery(db, queued.id, input, services)
-        : runPool(db, queued.id, input);
-      return { status: 202, body };
-    } catch (error) {
-      transaction(db, () => failJob(db, queued.id, error));
-      throw error;
-    }
+    scheduleJob(db, queued.id, JSON.parse(queued.input_snapshot), services);
+    return { status: 202, body: { ...jobView(jobRow(db, queued.id)), queued: true } };
   }
 
   if ((match = path.match(/^\/research-jobs\/([^/]+)\/results$/)) && method === 'GET') {

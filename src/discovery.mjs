@@ -85,7 +85,7 @@ function evidenceText(entry, excerpt) {
   ].join('\n').slice(0, 20000);
 }
 
-export async function discover({ db, input, services }) {
+export async function discover({ db, input, services, shouldStop = () => false, onStep = () => {} }) {
   const { searchWeb, fetchPage, completeJson, searchBase } = services;
   const queries = queriesFor(input);
   const failures = [];
@@ -93,6 +93,7 @@ export async function discover({ db, input, services }) {
   let searchRequests = 0, pageRequests = 0, costUsd = 0, skipped = 0;
 
   for (const query of queries) {
+    if (shouldStop()) throw new AppError(409, 'JOB_CANCELLED', '研究任务已取消。');
     searchRequests++;
     try { searchResults.push(...await searchWeb(query, { limit: 10 })); }
     catch (error) { failures.push({ step: 'SEARCH', reason: `${query}: ${error.message}` }); }
@@ -113,8 +114,10 @@ export async function discover({ db, input, services }) {
     } catch { skipped++; }
   }
 
+  onStep('ENRICHING');
   const entries = [];
   for (const entry of [...domains.values()].slice(0, Math.min(Math.max(input.quantity, 1), 12))) {
+    if (shouldStop()) throw new AppError(409, 'JOB_CANCELLED', '研究任务已取消。');
     pageRequests++;
     try { entries.push({ ...entry, page: await fetchPage(entry.origin, { maxBytes: 2_000_000 }) }); }
     catch (error) { failures.push({ step: 'FETCH', reason: `${entry.host}: ${error.message}` }); }
@@ -124,6 +127,8 @@ export async function discover({ db, input, services }) {
     return { candidates: [], failures, queries, counts: { discovered: domains.size, processed: 0, skipped, failed: 0, search_requests: searchRequests, page_requests: pageRequests, cost_usd: 0 }, details: { queries, model: null, prompt_version: PROMPT_VERSION, search_base: searchBase ?? null } };
   }
 
+  if (shouldStop()) throw new AppError(409, 'JOB_CANCELLED', '研究任务已取消。');
+  onStep('ANALYZING');
   const modelResult = await completeJson({ system: SYSTEM, prompt: promptFor(entries), maxTokens: 2500, temperature: 0.1 });
   if (process.env.DEBUG_DISCOVERY === '1') console.error('[discovery] model output', JSON.stringify(modelResult.data));
   costUsd = Number(modelResult.usage?.cost ?? 0) || 0;
@@ -132,6 +137,7 @@ export async function discover({ db, input, services }) {
   const byDomain = new Map(entries.map(entry => [entry.host, entry]));
   const seen = new Set(), candidates = [];
   for (const item of modelResult.data.candidates.slice(0, entries.length)) {
+    if (shouldStop()) throw new AppError(409, 'JOB_CANCELLED', '研究任务已取消。');
     const domain = String(item?.domain ?? '').toLowerCase().replace(/^www\./, '');
     const entry = byDomain.get(domain);
     if (!entry || seen.has(domain)) continue;

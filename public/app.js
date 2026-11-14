@@ -7,7 +7,7 @@ import { setupDrafts } from './drafts.js';
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
 const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
-const state = { workspace: null, accounts: [], accountOptions: [], accountTotal: 0, accountCursor: null, evidence: [], evidenceCursor: null, opportunities: [], opportunityOptions: [], opportunityTotal: 0, opportunityCursor: null, tasks: [], taskTotal: 0, taskCursor: null, upcomingTasks: [], researchJobs: [], researchJobTotal: 0, researchJobCursor: null, researchResults: null, sources: [], sourceOptions: [], sourceTotal: 0, sourceCursor: null, sourceReadiness: null, checkOptions: [], capabilityTotal: 0, capabilityCursor: null, identityTotal: 0, identityPendingTotal: 0, identityCursor: null, auditItems: [], auditCursor: null, detail: null, factoryDirty: false };
+const state = { workspace: null, accounts: [], accountOptions: [], accountTotal: 0, accountCursor: null, evidence: [], evidenceCursor: null, opportunities: [], opportunityOptions: [], opportunityTotal: 0, opportunityCursor: null, tasks: [], taskTotal: 0, taskCursor: null, upcomingTasks: [], researchJobs: [], researchJobTotal: 0, researchJobCursor: null, researchPollTimer: null, researchPollingId: null, researchResults: null, sources: [], sourceOptions: [], sourceTotal: 0, sourceCursor: null, sourceReadiness: null, checkOptions: [], capabilityTotal: 0, capabilityCursor: null, identityTotal: 0, identityPendingTotal: 0, identityCursor: null, auditItems: [], auditCursor: null, detail: null, factoryDirty: false };
 const date = value => new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
 
 async function api(path, method = 'GET', data) {
@@ -149,6 +149,10 @@ async function refresh() {
   renderAccounts(); renderEvidence(); renderOpportunities(); renderFollowups(); renderResearchJobs(); renderSources();
   if (location.hash === '#analytics') await loadAnalytics();
   if (location.hash.startsWith('#opportunities')) await loadSelectedOpportunity();
+  if (!state.researchPollTimer && !state.researchPollingId) {
+    const active = (state.researchJobs || []).find(job => ['QUEUED', 'RUNNING'].includes(job.status));
+    if (active) pollResearchJob(active.id);
+  }
 }
 function renderAccounts() {
   const query = $('#account-filter').value.trim();
@@ -189,16 +193,53 @@ function evidenceActions(item) {
     : '';
   return `<div class="sn-actions">${verify}<button class="sn-button sn-secondary" data-record="evidence" data-id="${escape(item.id)}" data-action="purge">按保留政策清除原文</button></div>`;
 }
+const analysisEventLabels = {
+  CLUMPING: '结块', LEAKAGE: '漏液', DISSOLUTION_FAILURE: '溶解失败', RESIDUE: '残留',
+  ODOR_CHANGE: '气味变化', PACKAGING_DAMAGE: '包装破损', PRODUCT_LAUNCH: '新品发布',
+  PRODUCT_EXPANSION: '产品扩展', OTHER: '其他信号', UNKNOWN: '未知信号',
+};
+const analysisIntentLabels = { DIRECT: '直接购买意图', INDIRECT: '间接意图', UNKNOWN: '未知' };
+const analysisUncertaintyLabels = { LOW: '低', MEDIUM: '中', HIGH: '高' };
+function analysisSection(item) {
+  if (item.purged_at || state.workspace?.integrations?.model?.status !== 'CONNECTED') return '';
+  return `<div class="sn-actions"><button class="sn-button sn-secondary" type="button" data-evidence-analyze="${escape(item.id)}">AI 分析证据</button></div><div class="sn-analysis" data-analysis-evidence="${escape(item.id)}"></div>`;
+}
+function assessmentMarkup(assessment) {
+  const facts = assessment.observed_facts.length
+    ? `<ul class="sn-history">${assessment.observed_facts.map(fact => `<li>${escape(fact.text)}${fact.references.map(reference => `<blockquote class="sn-quote">${escape(reference.quote)}</blockquote>`).join('')}</li>`).join('')}</ul>`
+    : '<p class="sn-helper">没有可引用的事实。</p>';
+  const hypotheses = assessment.business_hypotheses.length
+    ? `<ul class="sn-history">${assessment.business_hypotheses.map(item => `<li>${escape(item.type)} · 置信度 ${escape(item.confidence_label)}<p>${escape(item.reason)}</p></li>`).join('')}</ul>`
+    : '';
+  const missing = assessment.missing_information.length
+    ? `<p class="sn-helper">缺失信息：${assessment.missing_information.map(escape).join('；')}</p>` : '';
+  return `<div class="sn-record"><div class="sn-section-heading"><h3>${escape(analysisEventLabels[assessment.event_type] || assessment.event_type)}</h3><span class="sn-state">证据质量 ${escape(assessment.evidence_quality)}</span></div><p class="sn-helper">意图：${escape(analysisIntentLabels[assessment.intent_signal] || assessment.intent_signal)} · 不确定性：${escape(analysisUncertaintyLabels[assessment.uncertainty] || assessment.uncertainty)} · 基于证据版本 ${assessment.evidence_version} · ${date(assessment.created_at)}</p><p class="sn-helper">${escape(assessment.quality_reason)}</p>${facts}${hypotheses}${missing}<p class="sn-helper">模型 ${escape(assessment.model_version)} · Prompt ${escape(assessment.prompt_version)}。分析仅供人工参考，不改变商机资格。</p></div>`;
+}
+async function analyzeEvidenceItem(id, button) {
+  const label = button.textContent;
+  button.disabled = true; button.textContent = '正在分析…';
+  try {
+    await api(`/evidence/${encodeURIComponent(id)}/analyze`, 'POST', {});
+    const result = await api(`/evidence/${encodeURIComponent(id)}/assessments`);
+    const [latest, ...older] = result.items;
+    const markup = latest
+      ? assessmentMarkup(latest) + (older.length ? `<details class="sn-history-details"><summary>历史分析（${older.length}）</summary>${older.map(assessmentMarkup).join('')}</details>` : '')
+      : '';
+    document.querySelectorAll(`[data-analysis-evidence="${id}"]`).forEach(element => { element.innerHTML = markup; });
+    notify('AI 证据分析已保存，仅供人工参考，不改变商机资格。');
+  } catch (error) { notify(error.message); }
+  finally { button.disabled = false; button.textContent = label; }
+}
 function evidenceRecord(item) {
   const purged = Boolean(item.purged_at);
-  return `<div class="sn-record"><h3>${purged ? '原文已清除' : escape(verificationLabels[item.verification_status])} · ${escape(item.id.slice(0, 8))}</h3>${productUI.evidenceLabel(item)}<button class="sn-button sn-secondary" data-evidence-product="${escape(item.id)}" ${purged ? 'disabled' : ''}>修订产品归属</button>${purged ? `<p class="sn-helper">原文已按保留政策清除：${escape(item.purge_reason || '未填写原因')} 仅保留来源、时间与审计元数据。</p>` : `<blockquote class="sn-quote">${escape(item.raw_text)}</blockquote>`}${item.source_url ? `<a href="${escape(item.source_url)}" target="_blank" rel="noopener noreferrer">查看原始来源</a>` : '<p class="sn-helper">未提供来源</p>'}<p class="sn-helper">${escape(purged ? `清除原因：${item.purge_reason || '未填写'}` : (item.verification_note || '尚未人工核验'))}${!purged && item.checked_at ? ` · ${date(item.checked_at)}` : ''}</p>${evidenceActions(item)}</div>`;
+  return `<div class="sn-record"><h3>${purged ? '原文已清除' : escape(verificationLabels[item.verification_status])} · ${escape(item.id.slice(0, 8))}</h3>${productUI.evidenceLabel(item)}<button class="sn-button sn-secondary" data-evidence-product="${escape(item.id)}" ${purged ? 'disabled' : ''}>修订产品归属</button>${purged ? `<p class="sn-helper">原文已按保留政策清除：${escape(item.purge_reason || '未填写原因')} 仅保留来源、时间与审计元数据。</p>` : `<blockquote class="sn-quote">${escape(item.raw_text)}</blockquote>`}${item.source_url ? `<a href="${escape(item.source_url)}" target="_blank" rel="noopener noreferrer">查看原始来源</a>` : '<p class="sn-helper">未提供来源</p>'}<p class="sn-helper">${escape(purged ? `清除原因：${item.purge_reason || '未填写'}` : (item.verification_note || '尚未人工核验'))}${!purged && item.checked_at ? ` · ${date(item.checked_at)}` : ''}</p>${evidenceActions(item)}${analysisSection(item)}</div>`;
 }
 function renderEvidence() {
   if (!state.evidence.length) {
     $('#evidence-list').innerHTML = '<div class="sn-empty"><h2>让每条判断有据可查</h2><p>先在品牌池录入品牌，再保存产品页面、评论或其他公开资料的原文。系统只保存，不自动核验或推断采购意向。</p><a class="sn-text-link" href="#accounts">前往品牌池</a></div>';
     return;
   }
-  $('#evidence-list').innerHTML = state.evidence.map(item => `<article class="sn-evidence-entry"><div class="sn-section-heading"><h2>${escape(item.brand_name)}</h2><span class="sn-state">${item.purged_at ? '原文已清除' : escape(verificationLabels[item.verification_status])}</span></div>${productUI.evidenceLabel(item)}<div class="sn-evidence-meta"><span>观察时间 ${date(item.observed_at)}</span><span>发布时间 ${item.published_at ? date(item.published_at) : '未知'}</span></div>${item.purged_at ? `<p class="sn-helper">原文已按保留政策清除：${escape(item.purge_reason || '未填写原因')} 仅保留来源、时间与审计元数据。</p>` : `<blockquote class="sn-quote">${escape(item.raw_text)}</blockquote>`}${item.source_url ? `<a href="${escape(item.source_url)}" target="_blank" rel="noopener noreferrer">查看原始来源：${escape(item.source_url)}</a>` : '<p class="sn-helper">未提供来源，文本仅供补充线索。</p>'}<button class="sn-button sn-secondary" data-evidence-product="${escape(item.id)}" ${item.purged_at ? 'disabled' : ''}>修订产品归属</button><p class="sn-helper">${escape(item.purged_at ? `清除原因：${item.purge_reason || '未填写'}` : (item.verification_note || '尚未核对原始来源。'))}</p>${evidenceActions(item)}</article>`).join('') + (state.evidenceCursor ? '<div class="sn-actions"><button class="sn-button sn-secondary" type="button" data-evidence-more>加载更多证据</button></div>' : '');
+  $('#evidence-list').innerHTML = state.evidence.map(item => `<article class="sn-evidence-entry"><div class="sn-section-heading"><h2>${escape(item.brand_name)}</h2><span class="sn-state">${item.purged_at ? '原文已清除' : escape(verificationLabels[item.verification_status])}</span></div>${productUI.evidenceLabel(item)}<div class="sn-evidence-meta"><span>观察时间 ${date(item.observed_at)}</span><span>发布时间 ${item.published_at ? date(item.published_at) : '未知'}</span></div>${item.purged_at ? `<p class="sn-helper">原文已按保留政策清除：${escape(item.purge_reason || '未填写原因')} 仅保留来源、时间与审计元数据。</p>` : `<blockquote class="sn-quote">${escape(item.raw_text)}</blockquote>`}${item.source_url ? `<a href="${escape(item.source_url)}" target="_blank" rel="noopener noreferrer">查看原始来源：${escape(item.source_url)}</a>` : '<p class="sn-helper">未提供来源，文本仅供补充线索。</p>'}<button class="sn-button sn-secondary" data-evidence-product="${escape(item.id)}" ${item.purged_at ? 'disabled' : ''}>修订产品归属</button><p class="sn-helper">${escape(item.purged_at ? `清除原因：${item.purge_reason || '未填写'}` : (item.verification_note || '尚未核对原始来源。'))}</p>${evidenceActions(item)}${analysisSection(item)}</article>`).join('') + (state.evidenceCursor ? '<div class="sn-actions"><button class="sn-button sn-secondary" type="button" data-evidence-more>加载更多证据</button></div>' : '');
 }
 async function loadMoreEvidence() {
   if (!state.evidenceCursor) return;
@@ -212,6 +253,8 @@ document.addEventListener('click', event => {
   if (event.target.closest('[data-evidence-more]')) loadMoreEvidence().catch(error => notify(error.message));
   if (event.target.closest('[data-opportunities-more]')) loadOpportunities(false).catch(error => notify(error.message));
   if (event.target.closest('[data-tasks-more]')) loadTasks(false).catch(error => notify(error.message));
+  const analyze = event.target.closest('[data-evidence-analyze]');
+  if (analyze) analyzeEvidenceItem(analyze.dataset.evidenceAnalyze, analyze);
   if (event.target.closest('[data-sources-more]')) loadSources(false).catch(error => notify(error.message));
   if (event.target.closest('[data-research-jobs-more]')) loadResearchJobs(false).catch(error => notify(error.message));
   if (event.target.closest('[data-identities-more]')) loadIdentities(false).catch(error => notify(error.message));
@@ -403,11 +446,12 @@ formHandler('#source-form', async form => {
 const researchStatusLabels = { QUEUED: '排队中', RUNNING: '执行中', COMPLETED: '已完成', PARTIAL: '部分完成', FAILED: '失败', CANCELLED: '已取消' };
 const researchTierLabels = { PRIORITY_REVIEW: '优先审核', NEEDS_INFORMATION: '待补资料', NOT_FIT: '不匹配' };
 const researchStopLabels = { TARGET_REACHED: '达到数量上限', SOURCE_SCOPE_EXHAUSTED: '已分析完品牌池', BUDGET_EXHAUSTED: '预算耗尽', TIME_LIMIT: '时间用尽', DEPENDENCY_FAILURE: '依赖故障', USER_CANCELLED: '用户取消' };
+const researchStepLabels = { DISCOVERING: '发现来源', ENRICHING: '读取资料', ANALYZING: '模型分析', MATCHING: '匹配分档', CONTACT_ENRICHING: '联系人整理', DRAFTING: '草稿准备' };
 const contactStatusLabels = { CONTACT_NOT_FOUND: '未找到联系人', NO_VERIFIED_CHANNEL: '有联系人但无已核验渠道', AVAILABLE: '有已核验联系人' };
 function renderResearchJobs() {
   const jobs = state.researchJobs || [];
   $('#research-job-count').textContent = `${jobs.length} / ${state.researchJobTotal ?? jobs.length} 个任务`;
-  $('#research-job-list').innerHTML = jobs.length ? `<table class="sn-table"><caption>研究任务快照，包含执行状态、停止原因和来源模式</caption><thead><tr><th scope="col">创建时间</th><th scope="col">状态</th><th scope="col">来源</th><th scope="col">处理结果</th><th scope="col">停止原因</th><th scope="col">操作</th></tr></thead><tbody>${jobs.map(job => `<tr><td>${date(job.created_at)}</td><td>${researchStatusLabels[job.status] || escape(job.status)}<p class="sn-helper">第 ${job.attempt} 次执行</p></td><td>${job.source_mode === 'POOL' ? '仅品牌池' : '自动发现'}</td><td>发现 ${job.counts.discovered} · 新建机会 ${job.counts.new_opportunities} · 复用 ${job.counts.reused_opportunities} · 排除 ${job.counts.not_fit}</td><td>${researchStopLabels[job.stop_reason] || '—'}<p class="sn-helper">${job.budget.usage.cost_usd}/${job.budget.limits.cost_usd} USD · ${Math.round(job.budget.usage.runtime_ms / 1000)} 秒</p></td><td><button class="sn-button sn-secondary" data-research-results="${escape(job.id)}">查看结果</button>${['PARTIAL', 'FAILED'].includes(job.status) ? `<button class="sn-button sn-secondary" data-research-retry="${escape(job.id)}">重试</button>` : ''}${['QUEUED', 'RUNNING'].includes(job.status) ? `<button class="sn-button sn-secondary" data-research-cancel="${escape(job.id)}">取消</button>` : ''}</td></tr>`).join('')}</tbody></table>${state.researchJobCursor ? '<div class="sn-actions"><button class="sn-button sn-secondary" type="button" data-research-jobs-more>加载更多任务</button></div>' : ''}` : '<div class="sn-empty"><h3>还没有研究任务</h3><p>启用工厂档案后，可运行自动发现，或选择“仅分析品牌池”。</p></div>';
+  $('#research-job-list').innerHTML = jobs.length ? `<table class="sn-table"><caption>研究任务快照，包含执行状态、停止原因和来源模式</caption><thead><tr><th scope="col">创建时间</th><th scope="col">状态</th><th scope="col">来源</th><th scope="col">处理结果</th><th scope="col">停止原因</th><th scope="col">操作</th></tr></thead><tbody>${jobs.map(job => `<tr><td>${date(job.created_at)}</td><td>${researchStatusLabels[job.status] || escape(job.status)}<p class="sn-helper">${job.current_step ? (researchStepLabels[job.current_step] || escape(job.current_step)) : `第 ${job.attempt} 次执行`}</p></td><td>${job.source_mode === 'POOL' ? '仅品牌池' : '自动发现'}</td><td>发现 ${job.counts.discovered} · 新建机会 ${job.counts.new_opportunities} · 复用 ${job.counts.reused_opportunities} · 排除 ${job.counts.not_fit}</td><td>${researchStopLabels[job.stop_reason] || '—'}<p class="sn-helper">${job.budget.usage.cost_usd}/${job.budget.limits.cost_usd} USD · ${Math.round(job.budget.usage.runtime_ms / 1000)} 秒</p></td><td><button class="sn-button sn-secondary" data-research-results="${escape(job.id)}">查看结果</button>${['PARTIAL', 'FAILED'].includes(job.status) ? `<button class="sn-button sn-secondary" data-research-retry="${escape(job.id)}">重试</button>` : ''}${['QUEUED', 'RUNNING'].includes(job.status) ? `<button class="sn-button sn-secondary" data-research-cancel="${escape(job.id)}">取消</button>` : ''}</td></tr>`).join('')}</tbody></table>${state.researchJobCursor ? '<div class="sn-actions"><button class="sn-button sn-secondary" type="button" data-research-jobs-more>加载更多任务</button></div>' : ''}` : '<div class="sn-empty"><h3>还没有研究任务</h3><p>启用工厂档案后，可运行自动发现，或选择“仅分析品牌池”。</p></div>';
 }
 async function loadResearchJobs(reset = true) {
   const query = new URLSearchParams({ limit: '20' });
@@ -452,10 +496,38 @@ async function loadResearchResults(jobId) {
   try { renderResearchResults(await api(`/research-jobs/${encodeURIComponent(jobId)}/results`)); }
   catch (error) { $('#research-results').innerHTML = `<p role="alert">${escape(error.message)}</p>`; }
 }
+function stopResearchPolling() {
+  if (state.researchPollTimer) clearInterval(state.researchPollTimer);
+  state.researchPollTimer = null; state.researchPollingId = null;
+}
+async function pollResearchJob(id) {
+  if (state.researchPollingId === id && state.researchPollTimer) return;
+  stopResearchPolling();
+  state.researchPollingId = id;
+  const tick = async () => {
+    try {
+      const job = await api(`/research-jobs/${encodeURIComponent(id)}`);
+      await refresh();
+      if (['COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED'].includes(job.status)) {
+        stopResearchPolling();
+        await loadResearchResults(id);
+        notify(`研究任务${researchStatusLabels[job.status] || job.status}。人工审核与销售记录未被覆盖。`);
+      } else {
+        notify(`研究任务执行中：${researchStatusLabels[job.status] || job.status}${job.current_step ? ` · ${researchStepLabels[job.current_step] || job.current_step}` : ''}`);
+      }
+    } catch (error) {
+      stopResearchPolling(); notify(error.message);
+    }
+  };
+  await tick();
+  if (state.researchPollingId === id) state.researchPollTimer = setInterval(tick, 2000);
+}
 async function retryResearchJob(id) {
   try {
     const job = await api(`/research-jobs/${encodeURIComponent(id)}/retry`, 'POST', {});
-    await refresh(); await loadResearchResults(job.id);
+    await refresh();
+    if (['QUEUED', 'RUNNING'].includes(job.status)) pollResearchJob(job.id);
+    else await loadResearchResults(job.id);
     notify('研究任务已重试，人工审核与销售记录不会覆盖。');
   } catch (error) { notify(error.message); }
 }
@@ -463,6 +535,7 @@ async function cancelResearchJob(id) {
   if (!window.confirm('取消此研究任务？已完成的资料不会删除。')) return;
   try {
     await api(`/research-jobs/${encodeURIComponent(id)}/cancel`, 'POST', {});
+    stopResearchPolling();
     await refresh(); notify('研究任务已取消。');
   } catch (error) { notify(error.message); }
 }
@@ -486,8 +559,13 @@ $('#research-form').addEventListener('submit', async event => {
       source_mode: form.elements.source_mode.value, min_evidence_quality: form.elements.min_evidence_quality.value,
     });
     await refresh();
-    await loadResearchResults(job.id);
-    notify(job.status === 'COMPLETED' ? '研究已完成。结果仅整理已保存资料，未自动确认合格商机。' : `研究任务状态：${researchStatusLabels[job.status] || job.status}。`);
+    if (['QUEUED', 'RUNNING'].includes(job.status)) {
+      notify('研究任务已提交，正在后台执行…');
+      pollResearchJob(job.id);
+    } else {
+      await loadResearchResults(job.id);
+      notify(`研究任务状态：${researchStatusLabels[job.status] || job.status}。`);
+    }
   } catch (error) { formError(form, error); }
   finally {
     button.textContent = label; form.removeAttribute('aria-busy');

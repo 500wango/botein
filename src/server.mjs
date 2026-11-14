@@ -16,6 +16,7 @@ import { trackingApi } from './tracking.mjs';
 import { researchApi } from './research.mjs';
 import { sourcesApi, previewSource } from './sources.mjs';
 import { auditApi } from './audit.mjs';
+import { analyzeEvidence, listAssessments } from './analysis.mjs';
 import { olderThan, pageParams, pageRows } from './pagination.mjs';
 import { defaultDatabasePath } from './paths.mjs';
 import { searchWeb, searchStatus, searchConfig } from './search.mjs';
@@ -233,6 +234,14 @@ export function createApplication({ databasePath = defaultDatabasePath(), servic
       if ((route === '/api/v1/contacts' && method === 'GET') || /^\/api\/v1\/contacts\/[^/]+$/.test(route) || route === '/api/v1/contact-suppressions') {
         const body = method === 'PATCH' ? requestBody : {};
         const result = contactsApi(db, route.slice('/api/v1'.length), method, body, url.searchParams);
+        return json(res, result.status, result.body);
+      }
+      if ((route.match(/^\/api\/v1\/evidence\/([^/]+)\/analyze$/)) && method === 'POST') {
+        const result = await analyzeEvidence(db, route.match(/^\/api\/v1\/evidence\/([^/]+)\/analyze$/)[1], services);
+        return json(res, result.status, result.body);
+      }
+      if ((route.match(/^\/api\/v1\/evidence\/([^/]+)\/assessments$/)) && method === 'GET') {
+        const result = listAssessments(db, route.match(/^\/api\/v1\/evidence\/([^/]+)\/assessments$/)[1]);
         return json(res, result.status, result.body);
       }
       if (/^\/api\/v1\/(opportunities|contacts)(\/|$)/.test(route) || /^\/api\/v1\/evidence\/[^/]+\/(verify|invalidate|purge)$/.test(route)) {
