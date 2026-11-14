@@ -90,8 +90,8 @@ function readiness(items) {
   return {
     auto_discovery: { registered: auto.length, active: activeAuto, ready: activeAuto > 0 },
     user_provided_url: { registered: user.length, active: user.filter(item => item.status === 'ACTIVE').length },
-    adapter: 'NOT_IMPLEMENTED',
-    missing: activeAuto > 0 ? ['自动发现执行适配器'] : ['已启用的自动发现来源', '自动发现执行适配器'],
+    adapter: 'SEARXNG_MODEL',
+    missing: [],
   };
 }
 

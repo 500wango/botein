@@ -1,0 +1,12 @@
+use_default_settings: true
+server:
+  # Local-only development instance. Do not expose this port publicly.
+  secret_key: "botein-local-searxng-secret"
+  limiter: false
+  image_proxy: false
+search:
+  safe_search: 0
+  default_lang: en
+  formats:
+    - html
+    - json

@@ -215,6 +215,14 @@ export function openStore(path) {
       db.exec(`ALTER TABLE research_job_results ADD COLUMN next_actions TEXT NOT NULL DEFAULT '[]';
         PRAGMA user_version = 12;`);
     }
+    if (db.prepare('PRAGMA user_version').get().user_version < 13) {
+      db.exec(`ALTER TABLE research_jobs ADD COLUMN details TEXT NOT NULL DEFAULT '{}';
+        PRAGMA user_version = 13;`);
+    }
+    if (db.prepare('PRAGMA user_version').get().user_version < 14) {
+      db.exec(`ALTER TABLE draft_versions ADD COLUMN created_by TEXT NOT NULL DEFAULT 'MANUAL';
+        PRAGMA user_version = 14;`);
+    }
   });
   db.prepare('INSERT OR IGNORE INTO organizations VALUES (?, ?)').run(ORG, 'LANCCO 本地工作空间');
   db.prepare('INSERT OR IGNORE INTO factory_profiles VALUES (?, ?, ?, ?, ?)')

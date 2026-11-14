@@ -130,13 +130,16 @@ async function refresh() {
   draftUI.renderCapabilities();
   if (!state.factoryDirty) fillFactory();
   $('#factory-readiness').textContent = workspace.factory.status === 'ACTIVE' ? '基础能力已确认，具体对外声明仍需核验。' : 'LANCCO 官网资料已预填，等待负责人确认。';
+  const integrationsReady = Object.values(workspace.integrations).every(item => item.status === 'CONNECTED');
   $('#research-blocker').textContent = workspace.factory.status !== 'ACTIVE'
     ? '请先启用工厂档案，再运行研究。'
-    : '自动发现来源尚未接入；可选择“仅分析品牌池”，按已保存资料做确定性分档。';
+    : integrationsReady
+      ? '本地搜索与模型网关已接入，可运行自动发现；也可选择仅分析品牌池。'
+      : '自动发现需要本地 SearXNG 与模型网关；不可用时请选择“仅分析品牌池”。';
   $('#research-form [type="submit"]').disabled = workspace.factory.status !== 'ACTIVE';
   $('#factory-sources').innerHTML = workspace.sources.map(source => `<div class="sn-source"><a href="${escape(source.url)}" target="_blank" rel="noopener noreferrer">${escape(source.title)}</a><p>${escape(source.detail)}</p></div>`).join('');
   $('#factory-history').innerHTML = history.items.length ? history.items.map(item => `<li>版本 ${item.version} · ${date(item.published_at)}</li>`).join('') : '<li>尚无已启用版本</li>';
-  $('#integration-list').innerHTML = Object.values(workspace.integrations).map(item => `<article><h2>${escape(item.label)}</h2><span class="sn-state">尚未接入</span><p>${escape(item.detail)}</p></article>`).join('');
+  $('#integration-list').innerHTML = Object.values(workspace.integrations).map(item => `<article><h2>${escape(item.label)}</h2><span class="sn-state">${item.status === 'CONNECTED' ? '已接入' : '尚未接入'}</span><p>${escape(item.detail)}</p></article>`).join('');
   $$('[data-open]').forEach(button => { button.disabled = false; });
   $('#add-evidence').disabled = accountOptions.items.length === 0;
   $('#add-opportunity').disabled = accountOptions.items.length === 0;
@@ -350,8 +353,8 @@ function renderSources() {
   $('#source-count').textContent = `${items.length} / ${state.sourceTotal ?? items.length} 个来源`;
   $('#source-readiness').textContent = readiness
     ? readiness.auto_discovery.ready
-      ? `已启用 ${readiness.auto_discovery.active} 个自动发现来源；执行适配器尚未接入，自动发现任务仍会返回 503。`
-      : '尚未启用自动发现来源；自动发现任务会返回 503。登记后仍需人工核对并启用。'
+      ? `已启用 ${readiness.auto_discovery.active} 个自动发现来源；自动发现使用本地 SearXNG 与模型网关。`
+      : '尚未启用自动发现来源；自动发现使用配置的本地 SearXNG 与模型网关，来源登记用于受治理页面读取。'
     : '正在读取来源状态…';
   $('#source-list').innerHTML = items.length ? `<table class="sn-table"><caption>来源范围、授权记录与限速</caption><thead><tr><th scope="col">来源</th><th scope="col">类型</th><th scope="col">状态</th><th scope="col">允许域名</th><th scope="col">限制</th><th scope="col">保留方式</th><th scope="col">操作</th></tr></thead><tbody>${items.map(item => `<tr><td><strong>${escape(item.name)}</strong><p class="sn-helper">${escape(item.usage_note || '未填写使用方式与授权记录')}</p>${item.consecutive_failures ? `<p class="sn-helper">连续失败 ${item.consecutive_failures} 次${item.last_error ? `：${escape(item.last_error)}` : ''}</p>` : ''}</td><td>${sourceKindLabels[item.kind] || escape(item.kind)}</td><td>${sourceStatusLabels[item.status] || escape(item.status)}</td><td>${item.base_domains.map(escape).join('<br>')}</td><td>≤ ${item.rate_limit_per_15m} 次 / 15 分钟<br>美国 · 洗衣凝珠</td><td>${escape(item.retention_note || '未填写')}</td><td>${item.status === 'ACTIVE' ? `<button class="sn-button sn-secondary" data-source-disable="${escape(item.id)}" data-source-version="${item.version}">停用</button>` : `<button class="sn-button sn-secondary" data-source-activate="${escape(item.id)}" data-source-version="${item.version}">启用</button>`}</td></tr>`).join('')}</tbody></table>${state.sourceCursor ? '<div class="sn-actions"><button class="sn-button sn-secondary" type="button" data-sources-more>加载更多来源</button></div>' : ''}` : '<div class="sn-empty"><h3>还没有登记来源</h3><p>自动发现来源接入前，先登记使用方式、授权记录和允许域名。当前不会自动抓取。</p></div>';
 }
@@ -440,7 +443,7 @@ function renderResearchResults(result) {
     $('#research-results').innerHTML = summary + '<div class="sn-empty"><h3>本次没有可返回候选</h3><p>品牌池为空，或所有品牌都缺少基础资料。补齐品牌、产品和证据后重新研究。</p><a class="sn-text-link" href="#accounts">前往品牌池</a></div>';
     return;
   }
-  $('#research-results').innerHTML = summary + items.map(item => `<article class="sn-task-row"><div class="sn-task-heading"><h3>${escape(item.brand_name)}</h3><span class="sn-task-status">${researchTierLabels[item.tier] || escape(item.tier)}</span></div><div class="sn-detail-metadata"><a href="${escape(item.website)}" target="_blank" rel="noopener noreferrer">${escape(item.website)}</a><span>证据 ${item.evidence.verified}/${item.evidence.total} 已核验 · 质量 ${escape(item.evidence.quality)}</span><span>${contactStatusLabels[item.contact.status] || escape(item.contact.status)}</span></div><p>${escape(item.reason)}</p>${item.tier !== 'NOT_FIT' && item.missing_information.length ? `<p class="sn-helper">待补：${item.missing_information.map(escape).join('；')}</p>` : ''}${Array.isArray(item.next_actions) && item.next_actions.length ? `<ul class="sn-next-actions">${item.next_actions.map(action => `<li>${escape(action)}</li>`).join('')}</ul>` : ''}<p class="sn-helper">${escape(item.evidence.quality_reason)}</p><p class="sn-helper">草稿：模型网关未接入，未生成 AI 草稿。</p>${item.opportunity_id ? `<p class="sn-helper">已有商机：<a href="#opportunities/${escape(item.opportunity_id)}">${qualificationLabels[item.current_qualification_status] || escape(item.current_qualification_status || '')} · ${stageLabels[item.current_sales_stage] || escape(item.current_sales_stage || '')}</a>${item.is_new ? ' · 本次新建待审核商机' : ' · 复用既有商机，未覆盖审核与销售记录'}</p>` : item.tier === 'NOT_FIT' ? '<p class="sn-helper">已列入排除记录，不计入返回数量，不创建商机。</p>' : '<p class="sn-helper">品类未确认，未自动创建商机。</p>'}</article>`).join('');
+  $('#research-results').innerHTML = summary + items.map(item => `<article class="sn-task-row"><div class="sn-task-heading"><h3>${escape(item.brand_name)}</h3><span class="sn-task-status">${researchTierLabels[item.tier] || escape(item.tier)}</span></div><div class="sn-detail-metadata"><a href="${escape(item.website)}" target="_blank" rel="noopener noreferrer">${escape(item.website)}</a><span>证据 ${item.evidence.verified}/${item.evidence.total} 已核验 · 质量 ${escape(item.evidence.quality)}</span><span>${contactStatusLabels[item.contact.status] || escape(item.contact.status)}</span></div><p>${escape(item.reason)}</p>${item.tier !== 'NOT_FIT' && item.missing_information.length ? `<p class="sn-helper">待补：${item.missing_information.map(escape).join('；')}</p>` : ''}${Array.isArray(item.next_actions) && item.next_actions.length ? `<ul class="sn-next-actions">${item.next_actions.map(action => `<li>${escape(action)}</li>`).join('')}</ul>` : ''}<p class="sn-helper">${escape(item.evidence.quality_reason)}</p><p class="sn-helper">草稿：本轮未生成 AI 草稿；可在商机详情人工撰写。</p>${item.opportunity_id ? `<p class="sn-helper">已有商机：<a href="#opportunities/${escape(item.opportunity_id)}">${qualificationLabels[item.current_qualification_status] || escape(item.current_qualification_status || '')} · ${stageLabels[item.current_sales_stage] || escape(item.current_sales_stage || '')}</a>${item.is_new ? ' · 本次新建待审核商机' : ' · 复用既有商机，未覆盖审核与销售记录'}</p>` : item.tier === 'NOT_FIT' ? '<p class="sn-helper">已列入排除记录，不计入返回数量，不创建商机。</p>' : '<p class="sn-helper">品类未确认，未自动创建商机。</p>'}</article>`).join('');
 }
 async function loadResearchResults(jobId) {
   $('#research-results').innerHTML = '<p class="sn-muted">正在读取研究结果…</p>';

@@ -19,7 +19,7 @@ function getContact(db, id, accountId) {
 }
 function currentDraft(db, id) {
   const item = db.prepare(`SELECT d.id, d.opportunity_id, d.version, d.current_version_id, v.number, v.contact_id,
-    v.subject, v.body, v.claims, v.status, v.approval_snapshot, v.contact_snapshot, v.created_at
+    v.subject, v.body, v.claims, v.status, v.approval_snapshot, v.contact_snapshot, v.created_at, v.created_by
     FROM drafts d JOIN draft_versions v ON v.id=d.current_version_id AND v.organization_id=d.organization_id
     WHERE d.id=? AND d.organization_id=?`).get(id, ORG);
   requireValue(item, '草稿不存在。', undefined, 404, 'NOT_FOUND');
@@ -125,7 +125,7 @@ function draftDetail(db, id) {
   reconcileOne(db, currentDraft(db, id));
   const draft = currentDraft(db, id), validation = checks(db, draft);
   return { ...draft, claims: validation.claims, warnings: validation.warnings,
-    versions: db.prepare('SELECT id,number,contact_id,subject,body,claims,status,contact_snapshot,created_at FROM draft_versions WHERE draft_id=? AND organization_id=? ORDER BY number DESC').all(id, ORG).map(v => ({ ...v, claims: JSON.parse(v.claims), contact_snapshot: v.contact_snapshot ? JSON.parse(v.contact_snapshot) : null })),
+    versions: db.prepare('SELECT id,number,contact_id,subject,body,claims,status,contact_snapshot,created_at,created_by FROM draft_versions WHERE draft_id=? AND organization_id=? ORDER BY number DESC').all(id, ORG).map(v => ({ ...v, claims: JSON.parse(v.claims), contact_snapshot: v.contact_snapshot ? JSON.parse(v.contact_snapshot) : null })),
     reviews: db.prepare('SELECT r.action,r.reason,r.created_at,r.draft_version_id,r.snapshot FROM draft_reviews r JOIN draft_versions v ON v.id=r.draft_version_id AND v.organization_id=r.organization_id WHERE v.draft_id=? AND r.organization_id=? ORDER BY r.created_at DESC,r.rowid DESC').all(id, ORG).map(r => ({ ...r, snapshot: JSON.parse(r.snapshot) })),
   };
 }
@@ -156,6 +156,101 @@ function draftInput(db, body, opportunityId) {
   });
   return { subject, body: message, contact_id: contactId, claims, contact_snapshot: { full_name: person.full_name, job_title: person.job_title, email: person.email, source_url: person.source_url, version: person.version, provenance: 'AT_DRAFT_CREATION' } };
 }
+function insertDraft(db, opportunityId, input, action, details = {}, createdBy = 'MANUAL') {
+  const id = randomUUID(), versionId = randomUUID(), now = new Date().toISOString();
+  db.prepare('INSERT INTO drafts VALUES (?,?,?,?,?,?)').run(id, ORG, opportunityId, versionId, 1, now);
+  db.prepare('INSERT INTO draft_versions (id,organization_id,draft_id,number,contact_id,subject,body,claims,status,approval_snapshot,created_at,contact_snapshot,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(versionId, ORG, id, 1, input.contact_id, input.subject, input.body, JSON.stringify(input.claims), 'DRAFT', null, now, JSON.stringify(input.contact_snapshot), createdBy);
+  audit(db, action, versionId, details);
+  return draftDetail(db, id);
+}
+
+const DRAFT_PROMPT_VERSION = 'draft-v1';
+const clip = (value, max) => String(value ?? '').slice(0, max);
+const display = value => Array.isArray(value) ? value.join(' / ') : String(value ?? '');
+
+export async function generateDraft(db, opportunityId, body, services) {
+  requireValue(services.modelConfig().configured, '模型网关尚未配置。', undefined, 503, 'MODEL_NOT_CONNECTED');
+  const item = getOpportunity(db, opportunityId);
+  requireValue(!['REJECTED', 'ARCHIVED'].includes(item.qualification_status) && !['WON', 'LOST'].includes(item.sales_stage),
+    '已拒绝、归档或销售终态商机不生成新开发信。', undefined, 422, 'INVALID_TRANSITION');
+  const factory = profile(db);
+  requireValue(factory.status === 'ACTIVE', '请先启用工厂档案。', undefined, 422, 'FACTORY_NOT_ACTIVE');
+  const contactId = body.contact_id ? text(body.contact_id, 'contact_id', 100) : null;
+  const person = contactId ? getContact(db, contactId, item.account_id)
+    : db.prepare(`SELECT c.*, s.reason AS suppression_reason FROM contacts c
+        LEFT JOIN contact_suppressions s ON s.organization_id=c.organization_id AND s.email=c.email
+        WHERE c.organization_id=? AND c.account_id=? AND c.verification_status='VERIFIED' AND s.email IS NULL
+        ORDER BY c.created_at DESC, c.id DESC LIMIT 1`).get(ORG, item.account_id);
+  requireValue(person && person.verification_status === 'VERIFIED' && !person.suppression_reason,
+    '需要已核验且未禁止联系的联系人。', 'contact_id', 422, 'NO_VERIFIED_CONTACT');
+  const evidence = db.prepare(`SELECT id,source_url,raw_text,published_at,observed_at FROM evidence
+    WHERE organization_id=? AND account_id=? AND verification_status='VERIFIED' AND purged_at IS NULL
+    ORDER BY observed_at DESC, id DESC LIMIT 8`).all(ORG, item.account_id);
+  requireValue(evidence.length > 0, '没有可引用的已核验证据。', undefined, 422, 'NO_VERIFIED_EVIDENCE');
+  const seenFields = new Set();
+  const checks = db.prepare('SELECT * FROM factory_field_checks WHERE organization_id=? AND profile_version=? ORDER BY checked_at DESC,id DESC')
+    .all(ORG, factory.version).map(row => ({ ...row, value: JSON.parse(row.value) }))
+    .filter(check => {
+      if (seenFields.has(check.field) || JSON.stringify(check.value) !== JSON.stringify(factory[check.field])) return false;
+      seenFields.add(check.field); return true;
+    });
+  requireValue(checks.length > 0, '没有可引用的当前版本工厂字段核验。', undefined, 422, 'NO_VERIFIED_FACTORY_FIELD');
+
+  const evidenceBlock = evidence.map(entry => `[EVIDENCE ${entry.id}]\nsource: ${entry.source_url || 'unknown'}\n${clip(entry.raw_text, 1500)}`).join('\n\n');
+  const factoryBlock = checks.map(check => `[FACTORY ${check.id}] ${capabilityFields[check.field]}: ${display(check.value)}`).join('\n');
+  const prompt = `Write a first-contact B2B email in English from ${factory.factory_name} to ${item.brand_name}.
+The factory makes laundry pods and offers OEM/ODM services. The recipient is ${person.full_name}${person.job_title ? ` (${person.job_title})` : ''}.
+Keep it professional and concise, 80-130 words, with a single-line subject. Do not use hype or pressure.
+
+Every factual sentence about the brand must appear exactly in the subject or body and cite one EVIDENCE entry. Every factual sentence about the factory must appear exactly in the subject or body and cite one FACTORY entry. Greetings and questions need no citation. Copy quotes verbatim from the evidence. Never invent certifications, prices, volumes, MOQ, lead times, customer cases, or purchase intent.
+
+Return ONLY this JSON shape:
+{"subject":"...","body":"...","claims":[{"text":"exact sentence from subject/body","kind":"EVIDENCE","evidence_id":"...","quote":"verbatim substring of evidence text"},{"text":"exact sentence from subject/body","kind":"FACTORY","check_id":"..."}]}
+
+BRAND: ${item.brand_name}
+WEBSITE: ${item.website}
+INTERNAL REASON (context only, not citable): ${clip(item.reason, 500)}
+
+VERIFIED EVIDENCE:
+${evidenceBlock}
+
+VERIFIED FACTORY FIELDS:
+${factoryBlock}`;
+  const result = await services.completeJson({
+    system: 'You write careful B2B cold emails. Use only supplied verified evidence and factory fields. Return strict JSON only.',
+    prompt, maxTokens: 2000, temperature: 0.2,
+  });
+  const data = result.data ?? {};
+  requireValue(typeof data.subject === 'string' && typeof data.body === 'string' && Array.isArray(data.claims) && data.claims.length > 0,
+    '模型没有返回完整草稿或事实陈述。', undefined, 502, 'MODEL_INVALID_OUTPUT');
+  const claims = data.claims.slice(0, 30).map(claim => {
+    requireValue(claim && typeof claim === 'object', '模型返回的事实陈述格式无效。', undefined, 502, 'MODEL_INVALID_OUTPUT');
+    if (claim.kind === 'EVIDENCE') return {
+      text: String(claim.text ?? ''), kind: 'EVIDENCE',
+      evidence_id: String(claim.evidence_id ?? ''), quote: String(claim.quote ?? ''),
+    };
+    if (claim.kind === 'FACTORY') return {
+      text: String(claim.text ?? ''), kind: 'FACTORY', check_id: String(claim.check_id ?? ''),
+    };
+    throw new AppError(502, 'MODEL_INVALID_OUTPUT', '模型返回了不支持的事实引用类型。');
+  });
+  requireValue(claims.length > 0, '模型没有返回可校验的事实引用。', undefined, 502, 'MODEL_INVALID_OUTPUT');
+  let input;
+  try {
+    input = draftInput(db, { contact_id: person.id, subject: data.subject, body: data.body, claims }, opportunityId);
+  } catch (error) {
+    if (error instanceof AppError) {
+      throw new AppError(422, 'MODEL_CLAIM_VALIDATION_FAILED', `模型草稿未通过校验：${error.message}`, error.field);
+    }
+    throw error;
+  }
+  const draft = transaction(db, () => insertDraft(db, opportunityId, input, 'DRAFT_AI_GENERATED', {
+    model: result.model, prompt_version: DRAFT_PROMPT_VERSION, usage: result.usage, claims: claims.length,
+  }, 'AI'));
+  return { status: 201, body: { ...draft, generated: true, model: result.model, prompt_version: DRAFT_PROMPT_VERSION } };
+}
+
 export function draftsApi(db, path, method, body, query) {
   if (path === '/factory-profile/checks/options' && method === 'GET') {
     const factory = profile(db);
@@ -201,11 +296,8 @@ export function draftsApi(db, path, method, body, query) {
     const opportunityId = match[1]; getOpportunity(db, opportunityId);
     if (method === 'GET') return transaction(db, () => ({ status: 200, body: { items: db.prepare('SELECT id FROM drafts WHERE opportunity_id=? AND organization_id=? ORDER BY created_at DESC,id').all(opportunityId, ORG).map(r => draftDetail(db, r.id)) } }));
     if (method === 'POST') return transaction(db, () => {
-      const input = draftInput(db, body, opportunityId), id = randomUUID(), versionId = randomUUID(), now = new Date().toISOString();
-      db.prepare('INSERT INTO drafts VALUES (?,?,?,?,?,?)').run(id, ORG, opportunityId, versionId, 1, now);
-      db.prepare('INSERT INTO draft_versions (id,organization_id,draft_id,number,contact_id,subject,body,claims,status,approval_snapshot,created_at,contact_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(versionId, ORG, id, 1, input.contact_id, input.subject, input.body, JSON.stringify(input.claims), 'DRAFT', null, now, JSON.stringify(input.contact_snapshot));
-      audit(db, 'DRAFT_MANUALLY_CREATED', versionId);
-      return { status: 201, body: draftDetail(db, id) };
+      const input = draftInput(db, body, opportunityId);
+      return { status: 201, body: insertDraft(db, opportunityId, input, 'DRAFT_MANUALLY_CREATED') };
     });
   }
   if ((match = path.match(/^\/drafts\/([^/]+)$/))) {

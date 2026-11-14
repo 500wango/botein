@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { ORG, audit, profile, transaction } from './store.mjs';
 import { AppError, requireValue, text } from './validation.mjs';
 import { olderThan, pageParams, pageRows } from './pagination.mjs';
+import { discover } from './discovery.mjs';
 
 const ACCOUNT_TYPES = ['INDEPENDENT_BRAND', 'ECOMMERCE_BRAND'];
 const CONTACT_PREFERENCES = ['PRODUCT', 'PROCUREMENT', 'QUALITY'];
@@ -59,6 +60,7 @@ function jobView(row) {
     id: row.id, status: row.status, current_step: row.current_step, attempt: row.attempt,
     stop_reason: row.stop_reason, input: JSON.parse(row.input_snapshot), factory_version: row.factory_version,
     source_mode: row.source_mode, counts: JSON.parse(row.counts), budget: JSON.parse(row.budget),
+    details: JSON.parse(row.details ?? '{}'),
     created_at: row.created_at, started_at: row.started_at, finished_at: row.finished_at, version: row.version,
   };
 }
@@ -246,6 +248,65 @@ function runPool(db, id, input) {
   });
 }
 
+async function runDiscovery(db, id, input, services) {
+  const started = Date.now(), now = new Date().toISOString();
+  db.prepare(`UPDATE research_jobs SET status='RUNNING',current_step='DISCOVERING',started_at=COALESCE(started_at,?),version=version+1
+    WHERE id=? AND organization_id=?`).run(now, id, ORG);
+  step(db, id, 'ENRICHING');
+  let discovery;
+  try {
+    discovery = await discover({ db, input, services });
+  } catch (error) {
+    transaction(db, () => {
+      db.prepare('INSERT INTO research_job_failures VALUES (?,?,?,?,?,?,?)')
+        .run(randomUUID(), ORG, id, null, 'DISCOVERY', error.message, new Date().toISOString());
+      failJob(db, id, error);
+    });
+    throw error;
+  }
+  return transaction(db, () => {
+    const factory = profile(db);
+    const counts = {
+      discovered: discovery.counts.discovered ?? 0, processed: 0,
+      skipped: discovery.counts.skipped ?? 0, failed: discovery.failures.length,
+      not_fit: 0, new_opportunities: 0, reused_opportunities: 0, missing_contacts: 0, drafts_generated: 0,
+      search_requests: discovery.counts.search_requests ?? 0, page_requests: discovery.counts.page_requests ?? 0,
+      cost_usd: discovery.counts.cost_usd ?? 0,
+    };
+    for (const failure of discovery.failures) {
+      db.prepare('INSERT INTO research_job_failures VALUES (?,?,?,?,?,?,?)')
+        .run(randomUUID(), ORG, id, failure.account_id ?? null, failure.step, failure.reason, new Date().toISOString());
+    }
+    step(db, id, 'MATCHING');
+    for (const candidate of discovery.candidates) {
+      const account = db.prepare('SELECT * FROM accounts WHERE id=? AND organization_id=?').get(candidate.account_id, ORG);
+      if (!account) continue;
+      const analysed = analyseAccount(db, account, input);
+      saveResult(db, id, analysed, analysed.opportunity_id, false, factory.version);
+      counts.processed++;
+      if (analysed.contact.total === 0) counts.missing_contacts++;
+      if (analysed.opportunity_id) counts.reused_opportunities++;
+    }
+    const failed = discovery.failures.length > 0 && discovery.candidates.length === 0;
+    const partial = discovery.failures.length > 0 && discovery.candidates.length > 0;
+    const status = failed ? 'FAILED' : partial ? 'PARTIAL' : 'COMPLETED';
+    const stop = failed || partial ? 'DEPENDENCY_FAILURE' : 'SOURCE_SCOPE_EXHAUSTED';
+    const budget = JSON.parse(jobRow(db, id).budget);
+    budget.usage.search_requests = counts.search_requests;
+    budget.usage.page_requests = counts.page_requests;
+    budget.usage.cost_usd = counts.cost_usd;
+    budget.usage.runtime_ms = Date.now() - started;
+    db.prepare(`UPDATE research_jobs SET status=?,current_step=NULL,stop_reason=?,counts=?,budget=?,details=?,
+      finished_at=?,version=version+1 WHERE id=? AND organization_id=?`)
+      .run(status, stop, JSON.stringify(counts), JSON.stringify(budget), JSON.stringify(discovery.details ?? {}),
+        new Date().toISOString(), id, ORG);
+    audit(db, failed ? 'RESEARCH_JOB_FAILED' : 'RESEARCH_JOB_COMPLETED', id, {
+      source_mode: 'DISCOVERY', counts, details: discovery.details,
+    });
+    return jobView(jobRow(db, id));
+  });
+}
+
 function resultsView(db, id) {
   const job = jobRow(db, id);
   const items = db.prepare(`SELECT r.*, a.brand_name, a.website, o.qualification_status, o.sales_stage
@@ -264,7 +325,7 @@ function resultsView(db, id) {
       is_new: row.is_new === 1, created_at: row.created_at,
       current_qualification_status: row.qualification_status ?? null,
       current_sales_stage: row.sales_stage ?? null,
-      draft_status: 'MODEL_NOT_CONNECTED',
+      draft_status: 'NOT_GENERATED',
     }));
   return {
     job: jobView(job), items,
@@ -272,7 +333,7 @@ function resultsView(db, id) {
   };
 }
 
-export function researchApi(db, path, method, body, query) {
+export async function researchApi(db, path, method, body, query, services) {
   let match;
 
   if (path === '/research-jobs' && method === 'GET') {
@@ -288,8 +349,8 @@ export function researchApi(db, path, method, body, query) {
       status: 200, body: {
         items: page.items.map(jobView), next_cursor: page.next_cursor, total,
         limitations: {
-          discovery: '自动发现需要已启用的来源登记；执行适配器尚未接入，DISCOVERY 返回 503，不产生空转任务或费用。',
-          model: '模型网关尚未接入，研究结果不包含 AI 分析、联系人发现或邮件草稿。',
+          discovery: '自动发现通过本地 SearXNG 搜索公开网页，并由模型筛选候选；搜索或模型不可用时返回 503，不产生空转任务。',
+          model: '模型用于候选筛选；商机详情可生成待审 AI 草稿；联系人自动发现与 AI 证据分析尚未接入。',
           pool: 'POOL 仅分析本工作空间已保存的品牌、产品、证据和人工审核记录。',
         },
       },
@@ -298,6 +359,12 @@ export function researchApi(db, path, method, body, query) {
 
   if (path === '/research-jobs' && method === 'POST') {
     const input = researchInput(body);
+    if (input.source_mode === 'DISCOVERY') {
+      factoryReadiness(db);
+      const status = await services.searchStatus();
+      requireValue(status.reachable, '本地搜索服务不可用，请先启动 SearXNG。', undefined, 503, 'SEARCH_UNAVAILABLE');
+      requireValue(services.modelConfig().configured, '模型网关尚未配置。', undefined, 503, 'MODEL_NOT_CONNECTED');
+    }
     const key = body.idempotency_key ? text(body.idempotency_key, 'idempotency_key', 128) : '';
     const hash = createHash('sha256').update(JSON.stringify(input)).digest('hex');
     const created = transaction(db, () => {
@@ -309,12 +376,6 @@ export function researchApi(db, path, method, body, query) {
         }
       }
       const factory = factoryReadiness(db);
-      if (input.source_mode === 'DISCOVERY') {
-        const activeSources = db.prepare("SELECT count(*) AS n FROM sources WHERE organization_id=? AND kind='AUTO_DISCOVERY' AND status='ACTIVE'").get(ORG).n;
-        throw new AppError(503, 'SOURCE_UNAVAILABLE', activeSources > 0
-          ? '已启用自动发现来源，但执行适配器尚未接入；本次未启动任务。'
-          : '尚未启用自动发现来源；本次未启动任务，也未产生费用。可显式选择“仅分析品牌池”作为兜底。');
-      }
       const id = randomUUID(), now = new Date().toISOString();
       const counts = {
         discovered: 0, processed: 0, skipped: 0, failed: 0, not_fit: 0,
@@ -330,7 +391,10 @@ export function researchApi(db, path, method, body, query) {
     });
     if (created.replay) return { status: 202, body: { ...created.replay, replayed: true } };
     try {
-      return { status: 202, body: runPool(db, created.id, input) };
+      const body = input.source_mode === 'DISCOVERY'
+        ? await runDiscovery(db, created.id, input, services)
+        : runPool(db, created.id, input);
+      return { status: 202, body };
     } catch (error) {
       transaction(db, () => failJob(db, created.id, error));
       throw error;
@@ -359,7 +423,11 @@ export function researchApi(db, path, method, body, query) {
       return jobRow(db, row.id);
     });
     try {
-      return { status: 202, body: runPool(db, queued.id, JSON.parse(queued.input_snapshot)) };
+      const input = JSON.parse(queued.input_snapshot);
+      const body = queued.source_mode === 'DISCOVERY'
+        ? await runDiscovery(db, queued.id, input, services)
+        : runPool(db, queued.id, input);
+      return { status: 202, body };
     } catch (error) {
       transaction(db, () => failJob(db, queued.id, error));
       throw error;

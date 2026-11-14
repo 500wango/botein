@@ -56,7 +56,7 @@
             <h2>新建市场研究</h2><p class="sn-muted">产品范围继承工厂档案，你只需选择目标市场。</p>
             <label class="sn-field">目标市场<select name="market"><option value="US">美国 United States</option></select></label>
             <div class="sn-product-line"><span>目标品类</span><strong>洗衣凝珠</strong><span class="sn-muted">Laundry pods</span></div>
-            <label class="sn-field">来源模式<select name="source_mode"><option value="DISCOVERY">自动发现（来源尚未接入）</option><option value="POOL">仅分析品牌池（当前可用）</option></select><span class="sn-helper">自动发现没有可用来源时返回 503，不创建空转任务；品牌池模式只整理已经保存并核验的资料。</span></label>
+            <label class="sn-field">来源模式<select name="source_mode"><option value="DISCOVERY">自动发现（本地搜索 + 模型）</option><option value="POOL">仅分析品牌池</option></select><span class="sn-helper">自动发现使用本地 SearXNG 与模型筛选候选；不可用时返回 503。品牌池模式只整理已保存并核验的资料。</span></label>
             <div class="sn-form-row">
               <label class="sn-field">最多返回多少个机会<input name="quantity" type="number" min="1" max="50" value="20" required><span class="sn-helper">实际结果以证据为准，资料不足时不凑数。</span></label>
               <label class="sn-field">证据门槛<select name="min_evidence_quality"><option value="MEDIUM">MEDIUM · 已人工核验</option><option value="HIGH">HIGH · 当前无来源类型记录</option></select><span class="sn-helper">HIGH 需要记录第一方来源属性，当前规则只能判定 MEDIUM。</span></label>
@@ -164,7 +164,7 @@
           <p class="sn-helper">记录业务写入、状态变更、导出与来源读取。仅显示当前工作空间，不包含密码、Cookie 或页面正文。</p>
           <div id="audit-list"><p class="sn-muted">尚未加载审计记录。</p></div>
         </section>
-        <div class="sn-note"><h2>当前版本范围</h2><p>支持工厂档案、品牌产品/SKU 与证据、品牌池研究任务、人工商机审核、联系人、销售记录、跟进待办、去重漏斗及人工草稿版本审批。自动发现来源、AI 分析与 AI 生成仍待后续接入。</p><p>这是单人本地工作空间，数据保存在本机；已启用本地负责人登录，团队权限和多租户隔离尚未开放，请勿部署到公网。</p></div>
+        <div class="sn-note"><h2>当前版本范围</h2><p>支持工厂档案、品牌产品/SKU 与证据、品牌池研究任务、本地搜索与模型辅助的自动发现、AI 生成英文草稿、人工商机审核、联系人、销售记录、跟进待办、去重漏斗及草稿版本审批。AI 证据分析、联系人自动发现与多租户仍待后续接入。</p><p>这是单人本地工作空间，数据保存在本机；已启用本地负责人登录，团队权限和多租户隔离尚未开放，请勿部署到公网。</p></div>
       </section>
     </main>
     <footer class="sn-footer"><span>Botein</span><span>本地开发版 · 数据保存在本机</span></footer>

@@ -52,6 +52,24 @@ export function sourceUrl(value) {
   return url;
 }
 
+function metaContent(html, attribute, name) {
+  for (const tag of html.match(/<meta\b[^>]*>/gi) ?? []) {
+    if (!new RegExp(`\\b${attribute}\\s*=\\s*["']${name}["']`, 'i').test(tag)) continue;
+    const content = tag.match(/\bcontent\s*=\s*["']([^"']*)["']/i)?.[1];
+    if (content) return content;
+  }
+  return '';
+}
+
+export function extractPageMeta(html) {
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? '';
+  return {
+    title: htmlToText(title).text.slice(0, 300),
+    site_name: htmlToText(metaContent(html, 'property', 'og:site_name')).text.slice(0, 200),
+    description: htmlToText(metaContent(html, 'name', 'description')).text.slice(0, 500),
+  };
+}
+
 export function htmlToText(input) {
   const text = String(input)
     .replace(/<!--[\s\S]*?-->/g, ' ')
@@ -125,7 +143,7 @@ function requestOnce(url, address) {
   });
 }
 
-async function readBody(response) {
+async function readBody(response, maxBytes) {
   const encoding = String(response.headers['content-encoding'] || 'identity').toLowerCase();
   if (encoding !== 'identity') {
     response.resume();
@@ -137,23 +155,23 @@ async function readBody(response) {
     throw new AppError(415, 'SOURCE_TYPE_UNSUPPORTED', '来源不是可读取的网页或纯文本。', 'url');
   }
   const declared = Number(response.headers['content-length'] || 0);
-  if (declared > MAX_BYTES) {
+  if (declared > maxBytes) {
     response.resume();
-    throw new AppError(413, 'SOURCE_TOO_LARGE', '来源页面超过 512 KB，未读取。', 'url');
+    throw new AppError(413, 'SOURCE_TOO_LARGE', `来源页面超过 ${Math.round(maxBytes / 1024)} KB，未读取。`, 'url');
   }
   const chunks = []; let size = 0;
   for await (const chunk of response) {
     size += chunk.length;
-    if (size > MAX_BYTES) {
+    if (size > maxBytes) {
       response.destroy();
-      throw new AppError(413, 'SOURCE_TOO_LARGE', '来源页面超过 512 KB，未读取。', 'url');
+      throw new AppError(413, 'SOURCE_TOO_LARGE', `来源页面超过 ${Math.round(maxBytes / 1024)} KB，未读取。`, 'url');
     }
     chunks.push(chunk);
   }
   return { type, buffer: Buffer.concat(chunks), size };
 }
 
-export async function fetchPublicPage(input) {
+export async function fetchPublicPage(input, { maxBytes = MAX_BYTES } = {}) {
   if (typeof input !== 'string' || !input.trim()) throw new AppError(422, 'INVALID_URL', '请填写来源网址。', 'url');
   let current = sourceUrl(input.trim());
   allowFetch();
@@ -174,13 +192,14 @@ export async function fetchPublicPage(input) {
         response.resume();
         throw new AppError(502, 'SOURCE_HTTP_ERROR', `来源页面返回 ${response.statusCode}。`, 'url');
       }
-      const body = await readBody(response);
-      const extracted = htmlToText(body.buffer.toString('utf8'));
+      const body = await readBody(response, maxBytes);
+      const html = body.buffer.toString('utf8');
+      const extracted = htmlToText(html);
       return {
         requested_url: input.trim(), final_url: current.href, status_code: response.statusCode,
         content_type: body.type, byte_length: body.size, redirect_count: chain.length,
         redirect_chain: chain, fetched_at: new Date().toISOString(), text: extracted.text,
-        truncated: extracted.truncated, extraction: 'SIMPLE_TAG_STRIP',
+        truncated: extracted.truncated, extraction: 'SIMPLE_TAG_STRIP', metadata: extractPageMeta(html),
       };
     }
     throw new AppError(422, 'SOURCE_REDIRECT_LIMIT', '来源重定向次数过多，未继续读取。', 'url');

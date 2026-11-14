@@ -12,8 +12,16 @@ import { pageParams } from './pagination.mjs';
 import { sourceMatchesHost } from './sources.mjs';
 
 const fixturePassword = randomUUID() + randomUUID();
-async function runApp(databasePath, { authenticate = true } = {}) {
-  const app = createApplication({ databasePath });
+const offlineServices = {
+  searchWeb: async () => { throw new Error('search offline'); },
+  searchStatus: async () => ({ configured: true, reachable: false, base: 'offline' }),
+  fetchPage: async () => { throw new Error('fetch offline'); },
+  completeJson: async () => { throw new Error('model offline'); },
+  modelConfig: () => ({ configured: false, name: '' }),
+  searchBase: 'offline',
+};
+async function runApp(databasePath, { authenticate = true, services = offlineServices } = {}) {
+  const app = createApplication({ databasePath, services });
   await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${app.server.address().port}`;
   let cookie = '';
@@ -74,7 +82,7 @@ test('blocked research path: validation and deferred integrations never produce 
     assert.equal((await app.request('/factory-profile', 'PUT', { ...p, expected_version: p.version })).status, 409);
     await app.request('/factory-profile/activate', 'POST', { expected_version: saved.version, confirmed: true });
     const result = await app.request('/research-jobs', 'POST', { market: 'US', quantity: 20 });
-    assert.equal(result.status, 503); assert.equal(result.body.error.code, 'SOURCE_UNAVAILABLE');
+    assert.equal(result.status, 503); assert.equal(result.body.error.code, 'SEARCH_UNAVAILABLE');
     assert.deepEqual((await app.request('/research-jobs')).body.items, []);
     assert.equal((await app.request('/accounts', 'POST', { brand_name: 'bad', website: 'http://127.0.0.1' })).status, 422);
     assert.equal((await app.request('/accounts', 'POST', { brand_name: 'bad', website: 'https://example.com' }, { Origin: 'https://other.example' })).status, 403);
@@ -696,7 +704,7 @@ test('pool research: deterministic tiers reuse manual opportunities and never au
     assert.equal(byBrand['Pod Brand'].tier, 'PRIORITY_REVIEW');
     assert.equal(byBrand['Pod Brand'].opportunity_id, item.id);
     assert.equal(byBrand['Pod Brand'].current_qualification_status, 'QUALIFIED');
-    assert.equal(byBrand['Pod Brand'].draft_status, 'MODEL_NOT_CONNECTED');
+    assert.equal(byBrand['Pod Brand'].draft_status, 'NOT_GENERATED');
     assert.equal(byBrand['Unknown Catalog'].tier, 'NEEDS_INFORMATION');
     assert.equal(byBrand['Unknown Catalog'].opportunity_id, null);
     assert.ok(byBrand['Unknown Catalog'].missing_information.includes('洗衣凝珠品类产品资料'));
@@ -784,7 +792,7 @@ test('source registry: usage records, domain scope, activation and disable are a
     assert.equal(list.total, 1);
     assert.equal(list.readiness.auto_discovery.active, 1);
     assert.equal(list.readiness.auto_discovery.ready, true);
-    assert.deepEqual(list.readiness.missing, ['自动发现执行适配器']);
+    assert.deepEqual(list.readiness.missing, []);
     const disabled = await app.request(`/sources/${created.body.id}/disable`, 'POST', { expected_version: 2, reason: '暂停使用。' });
     assert.equal(disabled.body.status, 'DISABLED');
     assert.equal((await app.request('/sources')).body.readiness.auto_discovery.ready, false);
@@ -806,8 +814,8 @@ test('source changes re-require activation; DISCOVERY still never fabricates a j
     let source = (await app.request('/sources', 'POST', base)).body;
     source = (await app.request(`/sources/${source.id}/activate`, 'POST', { expected_version: source.version, terms_confirmed: true })).body;
     const discovery = await app.request('/research-jobs', 'POST', { market: 'US' });
-    assert.equal(discovery.status, 503); assert.equal(discovery.body.error.code, 'SOURCE_UNAVAILABLE');
-    assert.match(discovery.body.error.message, /执行适配器尚未接入/);
+    assert.equal(discovery.status, 503); assert.equal(discovery.body.error.code, 'SEARCH_UNAVAILABLE');
+    assert.match(discovery.body.error.message, /本地搜索服务不可用/);
     assert.equal((await app.request('/research-jobs')).body.items.length, 0);
     source = (await app.request(`/sources/${source.id}`, 'PATCH', { expected_version: source.version, retention_note: '仅保留引用片段，收到删除请求时清理正文。' })).body;
     assert.equal(source.status, 'ACTIVE');
@@ -971,6 +979,98 @@ test('source preview governance: domain scope, per-source limit and automatic di
     assert.equal((await app.request('/sources/preview', 'POST', { url: 'https://limitcheck.example.net', source_id: limited.id })).body.error.code, 'SOURCE_RATE_LIMITED');
     const limitedState = (await app.request('/sources')).body.items.find(item => item.id === limited.id);
     assert.equal(limitedState.consecutive_failures, 1);
+  } finally { await app.close(); }
+});
+
+test('AI draft generation validates claims and still requires human approval', async () => {
+  let proofId = '', checkId = '', calls = 0;
+  const services = {
+    ...offlineServices,
+    modelConfig: () => ({ configured: true, name: 'stub-model' }),
+    completeJson: async () => {
+      calls++;
+      if (calls === 1) return {
+        data: {
+          subject: 'Laundry pod production',
+          body: 'Your brand offers laundry pods in the US. We offer OEM and ODM services. May we discuss your product plans?',
+          claims: [
+            { text: 'Your brand offers laundry pods in the US.', kind: 'EVIDENCE', evidence_id: proofId, quote: 'Sample branded laundry pods offered in US.' },
+            { text: 'We offer OEM and ODM services.', kind: 'FACTORY', check_id: checkId },
+          ],
+        },
+        usage: { input_tokens: 100, output_tokens: 50, cost: 0.001 }, model: 'stub-model',
+      };
+      return {
+        data: {
+          subject: 'Bad draft',
+          body: 'Your brand offers laundry pods in the US.',
+          claims: [{ text: 'Your brand offers laundry pods in the US.', kind: 'EVIDENCE', evidence_id: proofId, quote: 'fabricated quote' }],
+        }, usage: {}, model: 'stub-model',
+      };
+    },
+  };
+  const app = await runApp(':memory:', { services });
+  try {
+    const { item, proof } = await prepareDraft(app);
+    proofId = proof.id;
+    checkId = (await app.request('/factory-profile/checks/options')).body.items.find(check => check.field === 'service_type').id;
+    const generated = await app.request(`/opportunities/${item.id}/drafts/generate`, 'POST', {});
+    assert.equal(generated.status, 201, JSON.stringify(generated.body));
+    assert.equal(generated.body.status, 'DRAFT'); assert.equal(generated.body.generated, true);
+    assert.equal(generated.body.created_by, 'AI');
+    assert.equal(generated.body.claims.length, 2);
+    assert.equal((await approveDraft(app, generated.body)).body.status, 'APPROVED');
+    const beforeInvalid = (await app.request(`/opportunities/${item.id}/drafts`)).body.items.length;
+    const invalid = await app.request(`/opportunities/${item.id}/drafts/generate`, 'POST', {});
+    assert.equal(invalid.status, 422); assert.equal(invalid.body.error.code, 'MODEL_CLAIM_VALIDATION_FAILED');
+    assert.equal((await app.request(`/opportunities/${item.id}/drafts`)).body.items.length, beforeInvalid);
+  } finally { await app.close(); }
+});
+
+test('discovery research uses search and model to create unverified candidates only', async () => {
+  const services = {
+    searchStatus: async () => ({ configured: true, reachable: true, base: 'stub' }),
+    searchWeb: async () => [
+      { title: 'Acme Pods', url: 'https://acme-pods.example.com/pods', content: 'Acme Pods laundry pods are sold in the US.' },
+      { title: 'Marketplace listing', url: 'https://www.amazon.com/laundry-pods', content: 'Amazon marketplace listing.' },
+    ],
+    fetchPage: async () => ({
+      final_url: 'https://acme-pods.example.com/', status_code: 200, content_type: 'text/html',
+      text: 'Acme Pods makes laundry pods for US homes.', byte_length: 200, redirect_count: 0,
+      redirect_chain: [], fetched_at: new Date().toISOString(), truncated: false,
+      extraction: 'SIMPLE_TAG_STRIP', metadata: { title: 'Acme Pods', site_name: 'Acme Pods', description: 'Laundry pods sold in the US.' },
+    }),
+    completeJson: async () => ({
+      data: { candidates: [{ domain: 'acme-pods.example.com', brand_name: 'Acme Pods', is_brand: true, product_signal: 'YES', us_signal: 'YES', reason: 'Brand site', evidence_excerpt: 'Laundry pods sold in the US.' }] },
+      usage: { cost: 0.001 }, model: 'stub-model',
+    }),
+    modelConfig: () => ({ configured: true, name: 'stub-model' }),
+    searchBase: 'stub',
+  };
+  const app = await runApp(':memory:', { services });
+  try {
+    const p = (await app.request('/workspace')).body.factory;
+    const saved = (await app.request('/factory-profile', 'PUT', { ...p, target_markets: ['US'], expected_version: p.version })).body;
+    await app.request('/factory-profile/activate', 'POST', { expected_version: saved.version, confirmed: true });
+    const workspace = (await app.request('/workspace')).body;
+    assert.equal(workspace.integrations.model.status, 'CONNECTED');
+    assert.equal(workspace.integrations.search.status, 'CONNECTED');
+    const job = await app.request('/research-jobs', 'POST', { market: 'US', quantity: 10 });
+    assert.equal(job.status, 202, JSON.stringify(job.body));
+    assert.equal(job.body.status, 'COMPLETED');
+    assert.equal(job.body.counts.discovered, 1); assert.equal(job.body.counts.processed, 1);
+    assert.equal(job.body.counts.new_opportunities, 0);
+    assert.equal(job.body.details.model, 'stub-model');
+    const accounts = (await app.request('/accounts')).body.items;
+    assert.equal(accounts.length, 1); assert.equal(accounts[0].brand_name, 'Acme Pods');
+    const evidence = (await app.request('/evidence')).body.items;
+    assert.equal(evidence.length, 1); assert.equal(evidence[0].verification_status, 'UNVERIFIED');
+    assert.match(evidence[0].raw_text, /Laundry pods sold in the US/);
+    const results = (await app.request(`/research-jobs/${job.body.id}/results`)).body;
+    assert.equal(results.items.length, 1); assert.equal(results.items[0].tier, 'NEEDS_INFORMATION');
+    assert.equal(results.items[0].opportunity_id, null);
+    assert.equal((await app.request('/opportunities')).body.items.length, 0);
+    assert.ok(Array.isArray((await app.request(`/research-jobs/${job.body.id}/failures`)).body.items));
   } finally { await app.close(); }
 });
 

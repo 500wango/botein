@@ -11,13 +11,16 @@ import { accountsApi } from './accounts.mjs';
 import { addEvidence } from './evidence.mjs';
 import { importEvidence, exportCsv } from './data-transfer.mjs';
 import { productsApi } from './products.mjs';
-import { draftsApi, reconcileApprovals } from './drafts.mjs';
+import { draftsApi, reconcileApprovals, generateDraft } from './drafts.mjs';
 import { trackingApi } from './tracking.mjs';
 import { researchApi } from './research.mjs';
 import { sourcesApi, previewSource } from './sources.mjs';
 import { auditApi } from './audit.mjs';
 import { olderThan, pageParams, pageRows } from './pagination.mjs';
 import { defaultDatabasePath } from './paths.mjs';
+import { searchWeb, searchStatus, searchConfig } from './search.mjs';
+import { completeJson, modelConfig } from './model.mjs';
+import { fetchPublicPage } from './source-fetch.mjs';
 import { AppError, requireValue, text, publicUrl, accountInput, factoryInput, parseCsv } from './validation.mjs';
 
 const publicDir = fileURLToPath(new URL('../public/', import.meta.url));
@@ -33,9 +36,9 @@ const assets = new Map([
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
   ['/assets/vercel-brand.css', ['assets/vercel-brand.css', 'text/css; charset=utf-8']],
 ]);
-const services = {
-  model: { status: 'NOT_CONNECTED', label: '模型网关', detail: '接入已延期，当前不调用模型或生成开发信。' },
-  search: { status: 'NOT_CONNECTED', label: '搜索服务', detail: '尚未接入自动发现执行适配器；可在接入状态登记并启用来源。可显式选择“仅分析品牌池”，自动发现任务返回 503。' },
+const defaultServices = {
+  searchWeb, searchStatus, searchBase: searchConfig().base,
+  fetchPage: fetchPublicPage, completeJson, modelConfig,
 };
 function json(res, status, body) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -58,7 +61,7 @@ async function bodyOf(req, maxBytes = 1_000_000) {
 function checkVersion(current, body) {
   requireValue(body.expected_version === current.version, '档案已被更新，请刷新后重新编辑。', undefined, 409, 'VERSION_CONFLICT');
 }
-export function createApplication({ databasePath = defaultDatabasePath() } = {}) {
+export function createApplication({ databasePath = defaultDatabasePath(), services = defaultServices } = {}) {
   const db = openStore(databasePath);
   const auth = createAuth(db);
   const server = createServer(async (req, res) => {
@@ -90,9 +93,16 @@ export function createApplication({ databasePath = defaultDatabasePath() } = {})
         auth.requireSession(req);
       }
       if (route === '/api/v1/workspace' && method === 'GET') {
+        const modelReady = services.modelConfig().configured;
+        let searchReady = false;
+        try { searchReady = (await services.searchStatus()).reachable; } catch { searchReady = false; }
         return json(res, 200, {
           organization: { id: ORG, name: 'LANCCO 本地工作空间' }, mode: 'LOCAL_SINGLE_USER',
-          factory: profile(db), sources: sourceNotes, integrations: services,
+          factory: profile(db), sources: sourceNotes,
+          integrations: {
+            model: { status: modelReady ? 'CONNECTED' : 'NOT_CONNECTED', label: '模型网关', detail: modelReady ? `已配置模型 ${services.modelConfig().name}，用于自动发现候选筛选。` : '未配置模型网关；自动发现不可用。' },
+            search: { status: searchReady ? 'CONNECTED' : 'NOT_CONNECTED', label: '搜索服务', detail: searchReady ? '本地 SearXNG 已连接，用于公开网页发现。' : '本地 SearXNG 未连接；自动发现不可用。' },
+          },
           counts: {
             accounts: db.prepare('SELECT count(*) AS n FROM accounts WHERE organization_id = ?').get(ORG).n,
             evidence: db.prepare('SELECT count(*) AS n FROM evidence WHERE organization_id = ?').get(ORG).n,
@@ -211,6 +221,10 @@ export function createApplication({ databasePath = defaultDatabasePath() } = {})
         const result = productsApi(db, route.slice('/api/v1'.length), method, body, url.searchParams);
         return json(res, result.status, result.body);
       }
+      if ((route.match(/^\/api\/v1\/opportunities\/([^/]+)\/drafts\/generate$/)) && method === 'POST') {
+        const result = await generateDraft(db, route.match(/^\/api\/v1\/opportunities\/([^/]+)\/drafts\/generate$/)[1], requestBody, services);
+        return json(res, result.status, result.body);
+      }
       if (/^\/api\/v1\/drafts\//.test(route) || /^\/api\/v1\/opportunities\/[^/]+\/drafts$/.test(route) || route === '/api/v1/factory-profile/checks' || route === '/api/v1/factory-profile/checks/options') {
         const body = ['POST', 'PATCH'].includes(method) ? requestBody : {};
         const result = draftsApi(db, route.slice('/api/v1'.length), method, body, url.searchParams);
@@ -244,7 +258,7 @@ export function createApplication({ databasePath = defaultDatabasePath() } = {})
       if (route.startsWith('/api/v1/research-jobs')) {
         const body = method === 'POST' ? requestBody : {};
         if (req.headers['idempotency-key']) body.idempotency_key = req.headers['idempotency-key'];
-        const result = researchApi(db, route.slice('/api/v1'.length), method, body, url.searchParams);
+        const result = await researchApi(db, route.slice('/api/v1'.length), method, body, url.searchParams, services);
         return json(res, result.status, result.body);
       }
       if (route.startsWith('/api/')) throw new AppError(404, 'NOT_FOUND', '接口不存在。');
