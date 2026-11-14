@@ -140,6 +140,8 @@ async function refresh() {
   $('#factory-sources').innerHTML = workspace.sources.map(source => `<div class="sn-source"><a href="${escape(source.url)}" target="_blank" rel="noopener noreferrer">${escape(source.title)}</a><p>${escape(source.detail)}</p></div>`).join('');
   $('#factory-history').innerHTML = history.items.length ? history.items.map(item => `<li>版本 ${item.version} · ${date(item.published_at)}</li>`).join('') : '<li>尚无已启用版本</li>';
   $('#integration-list').innerHTML = Object.values(workspace.integrations).map(item => `<article><h2>${escape(item.label)}</h2><span class="sn-state">${item.status === 'CONNECTED' ? '已接入' : '尚未接入'}</span><p>${escape(item.detail)}</p></article>`).join('');
+  $('#prep-search-status').textContent = workspace.integrations.search.status === 'CONNECTED' ? '已接入' : '尚未接入';
+  $('#prep-model-status').textContent = workspace.integrations.model.status === 'CONNECTED' ? '已接入' : '尚未接入';
   $$('[data-open]').forEach(button => { button.disabled = false; });
   $('#add-evidence').disabled = accountOptions.items.length === 0;
   $('#add-opportunity').disabled = accountOptions.items.length === 0;
@@ -372,7 +374,7 @@ async function activateSource(id, version) {
   if (!window.confirm('确认已核对来源的使用方式、授权或允许使用记录，以及原始内容保留方式？')) return;
   try {
     await api(`/sources/${encodeURIComponent(id)}/activate`, 'POST', { expected_version: Number(version), terms_confirmed: true });
-    await refresh(); notify('来源已启用。执行适配器尚未接入，自动发现仍不会开始抓取。');
+    await refresh(); notify('来源已启用。来源治理用于受治理页面读取；自动发现使用本地搜索与模型。');
   } catch (error) { notify(error.message); }
 }
 async function disableSource(id, version) {
@@ -405,7 +407,7 @@ const contactStatusLabels = { CONTACT_NOT_FOUND: '未找到联系人', NO_VERIFI
 function renderResearchJobs() {
   const jobs = state.researchJobs || [];
   $('#research-job-count').textContent = `${jobs.length} / ${state.researchJobTotal ?? jobs.length} 个任务`;
-  $('#research-job-list').innerHTML = jobs.length ? `<table class="sn-table"><caption>研究任务快照，包含执行状态、停止原因和来源模式</caption><thead><tr><th scope="col">创建时间</th><th scope="col">状态</th><th scope="col">来源</th><th scope="col">处理结果</th><th scope="col">停止原因</th><th scope="col">操作</th></tr></thead><tbody>${jobs.map(job => `<tr><td>${date(job.created_at)}</td><td>${researchStatusLabels[job.status] || escape(job.status)}<p class="sn-helper">第 ${job.attempt} 次执行</p></td><td>${job.source_mode === 'POOL' ? '仅品牌池' : '自动发现'}</td><td>发现 ${job.counts.discovered} · 新建机会 ${job.counts.new_opportunities} · 复用 ${job.counts.reused_opportunities} · 排除 ${job.counts.not_fit}</td><td>${researchStopLabels[job.stop_reason] || '—'}<p class="sn-helper">${job.budget.usage.cost_usd}/${job.budget.limits.cost_usd} USD · ${Math.round(job.budget.usage.runtime_ms / 1000)} 秒</p></td><td><button class="sn-button sn-secondary" data-research-results="${escape(job.id)}">查看结果</button>${['PARTIAL', 'FAILED'].includes(job.status) ? `<button class="sn-button sn-secondary" data-research-retry="${escape(job.id)}">重试</button>` : ''}${['QUEUED', 'RUNNING'].includes(job.status) ? `<button class="sn-button sn-secondary" data-research-cancel="${escape(job.id)}">取消</button>` : ''}</td></tr>`).join('')}</tbody></table>${state.researchJobCursor ? '<div class="sn-actions"><button class="sn-button sn-secondary" type="button" data-research-jobs-more>加载更多任务</button></div>' : ''}` : '<div class="sn-empty"><h3>还没有研究任务</h3><p>启用工厂档案后，选择“仅分析品牌池”运行第一次确定性研究。</p></div>';
+  $('#research-job-list').innerHTML = jobs.length ? `<table class="sn-table"><caption>研究任务快照，包含执行状态、停止原因和来源模式</caption><thead><tr><th scope="col">创建时间</th><th scope="col">状态</th><th scope="col">来源</th><th scope="col">处理结果</th><th scope="col">停止原因</th><th scope="col">操作</th></tr></thead><tbody>${jobs.map(job => `<tr><td>${date(job.created_at)}</td><td>${researchStatusLabels[job.status] || escape(job.status)}<p class="sn-helper">第 ${job.attempt} 次执行</p></td><td>${job.source_mode === 'POOL' ? '仅品牌池' : '自动发现'}</td><td>发现 ${job.counts.discovered} · 新建机会 ${job.counts.new_opportunities} · 复用 ${job.counts.reused_opportunities} · 排除 ${job.counts.not_fit}</td><td>${researchStopLabels[job.stop_reason] || '—'}<p class="sn-helper">${job.budget.usage.cost_usd}/${job.budget.limits.cost_usd} USD · ${Math.round(job.budget.usage.runtime_ms / 1000)} 秒</p></td><td><button class="sn-button sn-secondary" data-research-results="${escape(job.id)}">查看结果</button>${['PARTIAL', 'FAILED'].includes(job.status) ? `<button class="sn-button sn-secondary" data-research-retry="${escape(job.id)}">重试</button>` : ''}${['QUEUED', 'RUNNING'].includes(job.status) ? `<button class="sn-button sn-secondary" data-research-cancel="${escape(job.id)}">取消</button>` : ''}</td></tr>`).join('')}</tbody></table>${state.researchJobCursor ? '<div class="sn-actions"><button class="sn-button sn-secondary" type="button" data-research-jobs-more>加载更多任务</button></div>' : ''}` : '<div class="sn-empty"><h3>还没有研究任务</h3><p>启用工厂档案后，可运行自动发现，或选择“仅分析品牌池”。</p></div>';
 }
 async function loadResearchJobs(reset = true) {
   const query = new URLSearchParams({ limit: '20' });

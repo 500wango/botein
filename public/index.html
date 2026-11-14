@@ -69,8 +69,8 @@
             <h2>研究开始前</h2>
             <ol class="sn-checklist">
               <li><div><strong>确认工厂能力</strong><span id="factory-readiness">正在读取档案…</span></div><a href="#factory">查看档案</a></li>
-              <li><div><strong>连接搜索服务</strong><span>找到品牌官网，保留原始证据。</span></div><a href="#settings">尚未接入</a></li>
-              <li><div><strong>连接模型网关</strong><span>分析匹配原因，生成待审核草稿。</span></div><a href="#settings">稍后接入</a></li>
+              <li><div><strong>连接搜索服务</strong><span>找到品牌官网，保留原始证据。</span></div><a href="#settings" id="prep-search-status">读取中</a></li>
+              <li><div><strong>连接模型网关</strong><span>筛选候选品牌，生成待审核草稿。</span></div><a href="#settings" id="prep-model-status">读取中</a></li>
             </ol>
             <div class="sn-flow"><h3>结果如何交给你</h3><p>品牌与产品 → 证据与匹配 → 联系人和草稿</p><p class="sn-muted">由你审核、确认并人工发送，系统不自动触达客户。</p></div>
           </aside>
@@ -78,7 +78,7 @@
         <section class="sn-lower-section" aria-labelledby="research-results-title">
           <div class="sn-section-heading"><h2 id="research-results-title">研究结果</h2><span id="research-result-count" class="sn-muted"></span></div>
           <p class="sn-helper">结果按证据门槛分档，只使用已保存的品牌、产品、证据和人工审核记录。研究不会自动确认商机，也不会生成 AI 草稿。</p>
-          <div id="research-results"><p class="sn-muted">选择“仅分析品牌池”运行一次研究后，这里会显示分档结果与缺失资料。</p></div>
+          <div id="research-results"><p class="sn-muted">运行一次研究后，这里会显示分档结果与缺失资料。</p></div>
         </section>
         <section class="sn-lower-section" aria-labelledby="research-jobs-title">
           <div class="sn-section-heading"><h2 id="research-jobs-title">研究任务</h2><span id="research-job-count" class="sn-muted"></span><a class="sn-text-link" href="#settings">查看接入状态</a></div>
@@ -145,7 +145,7 @@
         <div id="analytics-results" aria-live="polite"></div>
       </section>
       <section data-view="settings" hidden>
-        <div class="sn-page-heading"><div><p class="sn-kicker">连接研究能力</p><h1>接入状态</h1><p class="sn-description">先整理业务资料，模型和搜索服务稍后连接。</p></div></div>
+        <div class="sn-page-heading"><div><p class="sn-kicker">连接研究能力</p><h1>接入状态</h1><p class="sn-description">搜索与模型网关按环境配置接入，状态在下方实时显示。</p></div></div>
         <section class="sn-auth-settings"><h2>负责人账号</h2><p id="auth-session-info" class="sn-helper"></p><button class="sn-button sn-secondary" id="open-password-change" type="button">修改密码并退出其他会话</button> <button class="sn-button sn-secondary" id="open-session-manager" type="button">查看有效登录</button></section>
         <section class="sn-lower-section" aria-labelledby="source-settings-title">
           <div class="sn-section-heading"><h2 id="source-settings-title">研究来源</h2><span id="source-count" class="sn-muted"></span><button class="sn-button sn-secondary" type="button" data-open="source-dialog" disabled>登记来源</button></div>
@@ -280,7 +280,7 @@
   </form></dialog>
   <dialog id="draft-editor-dialog" class="sn-dialog sn-wide-dialog" aria-label="编辑英文草稿"><form id="draft-editor-form">
     <div class="sn-dialog-heading"><h2>人工英文草稿</h2><button type="button" class="sn-close" data-close aria-label="关闭草稿编辑">×</button></div>
-    <p class="sn-helper">模型尚未接入。请填写自己的草稿并标出事实原句；每次保存编辑都会产生新版本并撤销旧批准。</p>
+    <p class="sn-helper">可人工撰写，也可在商机详情使用 AI 生成草稿；请标出事实原句。每次保存编辑都会产生新版本并撤销旧批准。</p>
     <label class="sn-field">目标联系人<select name="contact_id" required></select></label>
     <label class="sn-field">英文主题<input name="subject" maxlength="200" required></label>
     <label class="sn-field">英文正文<textarea name="body" rows="8" maxlength="10000" required></textarea></label>
