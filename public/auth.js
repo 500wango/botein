@@ -1,12 +1,17 @@
 const $ = selector => document.querySelector(selector);
 export function startAuth({ onAuthenticated, notify, dirty, clearDirty }) {
-  let setup = false, authenticated = false, reloading = false, currentUser = null, checking = false;
+  let setup = false, multiOrgEnabled = true, authMode = 'login', authenticated = false, reloading = false, currentUser = null, checking = false;
   async function request(path, body) {
     const response = await fetch(`/api/v1/auth${path}`, { method: body ? 'POST' : 'GET', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
-    const data = await response.json();
+    const raw = await response.text();
+    let data = {};
+    if (raw) {
+      try { data = JSON.parse(raw); }
+      catch { throw Object.assign(new Error(`服务端返回异常响应 (${response.status})，请重试。`), { status: response.status }); }
+    }
     if (!response.ok) {
       const error = new Error(data.error?.message || '账号服务暂不可用，请重试。');
-      error.status = response.status; error.field = data.error?.field;
+      error.status = response.status; error.code = data.error?.code; error.field = data.error?.field;
       throw error;
     }
     return data;
@@ -25,37 +30,94 @@ export function startAuth({ onAuthenticated, notify, dirty, clearDirty }) {
     if (field instanceof HTMLElement) field.focus();
     else { node.tabIndex = -1; node.focus(); }
   }
+  function applyAuthFormMode(mode) {
+    authMode = setup ? 'setup' : mode;
+    const form = $('#auth-form');
+    form.hidden = false;
+    form.dataset.mode = authMode;
+    form.querySelector('.sn-form-error').hidden = true;
+    const isSetup = authMode === 'setup';
+    const isReg = authMode === 'register';
+    const isInvite = authMode === 'accept_invite';
+    const isResetReq = authMode === 'reset_request';
+    const isResetConf = authMode === 'reset_confirm';
+    const isLogin = authMode === 'login';
+
+    $('#auth-org-name-field').hidden = !isReg; form.elements.org_name.required = isReg;
+    $('#auth-org-field').hidden = isSetup || isInvite || isResetConf;
+    form.elements.org_slug.required = isReg;
+    $('#auth-token-field').hidden = !(isInvite || isResetConf);
+    form.elements.token.required = isInvite || isResetConf;
+    $('#auth-display-field').hidden = !(isSetup || isReg);
+    form.elements.display_name.required = isSetup || isReg;
+    $('#auth-email-field').hidden = !(isSetup || isReg);
+    $('#auth-username-field').hidden = isInvite || isResetConf;
+    form.elements.username.required = !(isInvite || isResetConf);
+    $('#auth-password-field').hidden = isResetReq;
+    form.elements.password.required = !isResetReq;
+    $('#auth-confirm-field').hidden = !(isSetup || isReg || isInvite || isResetConf);
+    form.elements.confirm_password.required = isSetup || isReg || isInvite || isResetConf;
+    $('#auth-totp-field').hidden = true;
+    $('#auth-username-help').hidden = !(isSetup || isReg);
+    form.elements.password.autocomplete = isLogin ? 'current-password' : 'new-password';
+    if (isSetup || isReg || isInvite || isResetConf) form.elements.password.minLength = 8;
+    else form.elements.password.removeAttribute('minlength');
+
+    const titles = {
+      setup: '创建本地负责人账号',
+      login: '登录你的工作空间',
+      register: '注册新企业工作空间',
+      accept_invite: '接受团队成员邀请',
+      reset_request: '请求重置密码',
+      reset_confirm: '使用重置凭据设置新密码',
+    };
+    const submitLabels = {
+      setup: '创建账号并进入',
+      login: '登录',
+      register: '注册并进入工作空间',
+      accept_invite: '设置密码并加入',
+      reset_request: '发送重置凭据',
+      reset_confirm: '确认重置密码',
+    };
+    $('#auth-title').textContent = titles[authMode] || '登录';
+    document.title = `${$('#auth-title').textContent} · Botein`;
+    form.querySelector('[type=submit]').textContent = submitLabels[authMode] || '提交';
+    $('#auth-mode-actions').hidden = setup;
+    if ($('#auth-mode-register')) $('#auth-mode-register').hidden = !multiOrgEnabled;
+    $('#auth-password-help').textContent = isLogin ? '支持粘贴和密码管理器。' : '至少 8 个字符，最多 256 个 UTF-8 字节。';
+  }
+  function updateMfaUi() {
+    const enabled = Boolean(currentUser?.mfa_enabled);
+    if ($('#auth-mfa-status')) $('#auth-mfa-status').textContent = `双因素认证（TOTP）：${enabled ? '已开启' : '未开启（建议绑定 Authenticator）'}`;
+    if ($('#mfa-setup-panel')) $('#mfa-setup-panel').hidden = enabled;
+    if ($('#mfa-disable-form')) $('#mfa-disable-form').hidden = !enabled;
+  }
   async function status() {
     $('#auth-retry').hidden = true;
     try {
       const info = await request('/status');
       setup = info.setup_required;
+      multiOrgEnabled = info.multi_org_enabled !== false;
       if (info.authenticated) {
         currentUser = info.user;
+        const roleLabel = info.user.role === 'OWNER' ? '负责人 (OWNER)' : '团队成员 (MEMBER)';
+        document.body.dataset.role = info.user.role || 'OWNER';
+        document.querySelectorAll('[data-owner-only]').forEach(el => { el.hidden = info.user.role !== 'OWNER'; });
         // Never show a cached business view until authentication and data loading have both succeeded.
         await onAuthenticated();
         authenticated = true;
-        $('#signed-in-owner').textContent = ` / ${info.user.display_name}`;
-        $('#auth-session-info').textContent = `账号 ${info.user.username} · 本地负责人 · 本次登录到期 ${new Date(info.expires_at).toLocaleString('zh-CN')}。`;
+        if ($('#workspace-name')) $('#workspace-name').textContent = info.organization?.name || 'LANCCO';
+        $('#signed-in-owner').textContent = ` / ${info.user.display_name} (${info.user.role || 'OWNER'})`;
+        $('#auth-session-info').textContent = `账号 ${info.user.username} · ${roleLabel} · 工作区 ${info.organization?.name || '本地'} · 本次登录到期 ${new Date(info.expires_at).toLocaleString('zh-CN')}。`;
+        updateMfaUi();
         $('#auth-screen').hidden = true; $('#workspace-shell').hidden = false;
         const title = document.querySelector('[data-view]:not([hidden]) h1')?.textContent || '工作空间';
         document.title = `${title} · Botein`;
         $('#main').focus();
         return;
       }
-      $('#auth-title').textContent = setup ? '创建本地负责人账号' : '登录你的工作空间';
-      document.title = `${$('#auth-title').textContent} · Botein`;
       $('#auth-description').textContent = setup ? '首次设置只创建本地登录账号，现有工厂和业务资料会继续保留。' : '登录后继续整理线索、审核草稿和跟进客户。';
-      const form = $('#auth-form'); form.hidden = false;
-      form.dataset.mode = setup ? 'setup' : 'login';
-      $('#auth-display-field').hidden = !setup; form.elements.display_name.required = setup;
-      $('#auth-confirm-field').hidden = !setup; form.elements.confirm_password.required = setup;
-      $('#auth-username-help').hidden = !setup;
-      form.elements.password.autocomplete = setup ? 'new-password' : 'current-password';
-      if (setup) form.elements.password.minLength = 8;
-      else form.elements.password.removeAttribute('minlength');
-      form.querySelector('[type=submit]').textContent = setup ? '创建账号并进入' : '登录';
-      $('#auth-password-help').textContent = setup ? '至少 8 个字符，最多 256 个 UTF-8 字节。请保存到密码管理器。' : '支持粘贴和密码管理器。';
+      applyAuthFormMode(setup ? 'setup' : authMode);
     } catch (error) {
       $('#auth-feedback').textContent = `读取失败：${error.message}`;
       $('#auth-retry').hidden = false;
@@ -64,19 +126,87 @@ export function startAuth({ onAuthenticated, notify, dirty, clearDirty }) {
   $('#auth-feedback').textContent = sessionStorage.getItem('botein-auth-message') || '';
   sessionStorage.removeItem('botein-auth-message');
   $('#auth-retry').addEventListener('click', status);
+  $('#auth-mode-actions')?.addEventListener('click', event => {
+    const btn = event.target.closest('[data-auth-mode]');
+    if (btn) applyAuthFormMode(btn.dataset.authMode);
+  });
   $('#auth-form').addEventListener('submit', async event => {
     event.preventDefault();
     const form = event.currentTarget, button = form.querySelector('[type=submit]');
     form.querySelector('.sn-form-error').hidden = true;
-    if (setup && form.elements.password.value !== form.elements.confirm_password.value) return showError(form, { message:'两次输入的密码不一致。', field:'confirm_password' });
-    const label = button.textContent; button.disabled = true; button.textContent = setup ? '正在创建…' : '正在登录…';
+    const needsConfirm = ['setup', 'register', 'accept_invite', 'reset_confirm'].includes(authMode);
+    if (needsConfirm && form.elements.password.value !== form.elements.confirm_password.value) {
+      return showError(form, { message: '两次输入的密码不一致。', field: 'confirm_password' });
+    }
+    const label = button.textContent; button.disabled = true; button.textContent = '提交中…';
     try {
-      await request(setup ? '/setup' : '/login', { username: form.elements.username.value, display_name: form.elements.display_name.value, password: form.elements.password.value });
+      if (authMode === 'reset_request') {
+        const res = await request('/password-reset/request', {
+          username: form.elements.username.value,
+          org_slug: form.elements.org_slug.value.trim() || undefined,
+        });
+        $('#auth-feedback').textContent = res.message || '如果账号存在，重置指令已发送。';
+        applyAuthFormMode('reset_confirm');
+        return;
+      }
+      if (authMode === 'reset_confirm') {
+        await request('/password-reset/confirm', {
+          token: form.elements.token.value.trim(),
+          new_password: form.elements.password.value,
+        });
+        $('#auth-feedback').textContent = '密码已重置，请使用新密码登录。';
+        form.reset();
+        applyAuthFormMode('login');
+        return;
+      }
+      if (authMode === 'accept_invite') {
+        await request('/invitations/accept', {
+          token: form.elements.token.value.trim(),
+          display_name: form.elements.display_name.value.trim() || undefined,
+          password: form.elements.password.value,
+        });
+        form.reset(); await status();
+        return;
+      }
+      if (authMode === 'register') {
+        await request('/organizations/register', {
+          org_name: form.elements.org_name.value,
+          org_slug: form.elements.org_slug.value,
+          username: form.elements.username.value,
+          display_name: form.elements.display_name.value,
+          email: form.elements.email.value.trim() || undefined,
+          password: form.elements.password.value,
+        });
+        form.reset(); await status();
+        return;
+      }
+      if (authMode === 'setup') {
+        await request('/setup', {
+          username: form.elements.username.value,
+          display_name: form.elements.display_name.value,
+          email: form.elements.email.value.trim() || undefined,
+          password: form.elements.password.value,
+        });
+        form.reset(); await status();
+        return;
+      }
+      await request('/login', {
+        username: form.elements.username.value,
+        org_slug: form.elements.org_slug.value.trim() || undefined,
+        password: form.elements.password.value,
+        totp_code: form.elements.totp_code.value.trim() || undefined,
+      });
       form.reset(); await status();
     } catch (error) {
-      form.elements.password.value = ''; form.elements.confirm_password.value = '';
-      showError(form, error);
-      if (error.status === 409) await status();
+      if (error.code === 'MFA_REQUIRED') {
+        $('#auth-totp-field').hidden = false;
+        showError(form, error);
+        form.elements.totp_code.focus();
+      } else {
+        form.elements.password.value = ''; form.elements.confirm_password.value = '';
+        showError(form, error);
+        if (error.status === 409) await status();
+      }
     } finally { button.disabled = false; button.textContent = label; }
   });
   $('#logout-button').addEventListener('click', async event => {
@@ -99,7 +229,8 @@ export function startAuth({ onAuthenticated, notify, dirty, clearDirty }) {
     try {
       const result = await request('/password', { current_password: form.elements.current_password.value, new_password: form.elements.new_password.value });
       form.reset(); $('#password-dialog').close();
-      $('#auth-session-info').textContent = `账号 ${currentUser.username} · 本地负责人 · 本次登录到期 ${new Date(result.expires_at).toLocaleString('zh-CN')}。`;
+      const roleLabel = currentUser?.role === 'OWNER' ? '负责人 (OWNER)' : '团队成员 (MEMBER)';
+      $('#auth-session-info').textContent = `账号 ${currentUser.username} · ${roleLabel} · 本次登录到期 ${new Date(result.expires_at).toLocaleString('zh-CN')}。`;
       notify('密码已更新，其他登录会话已退出；本窗口保留登录。');
     } catch (error) {
       form.elements.current_password.value = ''; form.elements.new_password.value = ''; form.elements.confirm_password.value = '';
@@ -167,6 +298,62 @@ export function startAuth({ onAuthenticated, notify, dirty, clearDirty }) {
   });
   $('#refresh-sessions').addEventListener('click', loadSessions);
   $('#revoke-other-sessions').addEventListener('click', () => revokeSession());
+  $('#open-mfa-setup')?.addEventListener('click', () => {
+    $('#mfa-secret-box').hidden = true;
+    $('#mfa-enable-form')?.reset();
+    $('#mfa-disable-form')?.reset();
+    $('#mfa-enable-form .sn-form-error').hidden = true;
+    $('#mfa-disable-form .sn-form-error').hidden = true;
+    updateMfaUi();
+    $('#mfa-dialog').showModal();
+  });
+  $('#mfa-generate-btn')?.addEventListener('click', async () => {
+    try {
+      const res = await request('/mfa/setup', {});
+      $('#mfa-secret-box').hidden = false;
+      const box = $('#mfa-secret-box');
+      box.replaceChildren();
+      const p1 = document.createElement('p');
+      p1.append('密钥 (Base32)：');
+      const c1 = document.createElement('code');
+      c1.textContent = res.secret;
+      p1.append(c1);
+      const p2 = document.createElement('p');
+      p2.className = 'sn-helper';
+      p2.append('URI：');
+      const c2 = document.createElement('code');
+      c2.textContent = res.otpauth_uri;
+      p2.append(c2);
+      box.append(p1, p2);
+    } catch (error) { notify(error.message); }
+  });
+  $('#mfa-enable-form')?.addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    form.querySelector('.sn-form-error').hidden = true;
+    try {
+      await request('/mfa/enable', { totp_code: form.elements.totp_code.value.trim() });
+      currentUser.mfa_enabled = true;
+      updateMfaUi();
+      $('#mfa-dialog').close();
+      notify('双因素认证已开启，下次登录需验证 6 位动态码。');
+    } catch (error) { showError(form, error); }
+  });
+  $('#mfa-disable-form')?.addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    form.querySelector('.sn-form-error').hidden = true;
+    try {
+      await request('/mfa/disable', {
+        current_password: form.elements.current_password.value,
+        totp_code: form.elements.totp_code.value.trim(),
+      });
+      currentUser.mfa_enabled = false;
+      updateMfaUi();
+      $('#mfa-dialog').close();
+      notify('双因素认证已关闭。');
+    } catch (error) { showError(form, error); }
+  });
   window.addEventListener('sn-auth-expired', () => forget('登录已过期或被撤销，请重新登录。未保存输入已清除。'));
   window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
   async function recheck() {

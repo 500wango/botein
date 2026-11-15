@@ -1,4 +1,4 @@
-import { ORG } from './store.mjs';
+import { requestContext } from './store.mjs';
 import { AppError, requireValue } from './validation.mjs';
 
 const MAX_LIMIT = 100;
@@ -11,7 +11,8 @@ function decodeCursor(value) {
 
 // Newest first, cursor on the monotonic audit rowid. No credentials or page text
 // are stored in details; the caller only reads the current organization.
-export function auditApi(db, path, method, query) {
+export function auditApi(db, path, method, query, ctx = null) {
+  const { orgId } = requestContext(ctx);
   if (path !== '/audit-logs' || method !== 'GET') throw new AppError(404, 'NOT_FOUND', '接口不存在。');
   const rawLimit = query.get('limit');
   const limit = rawLimit === null ? 20 : Number(rawLimit);
@@ -20,9 +21,9 @@ export function auditApi(db, path, method, query) {
   const before = cursor ? decodeCursor(cursor) : null;
   const rows = before === null
     ? db.prepare(`SELECT rowid,id,action,object_id,details,created_at FROM audit_logs
-        WHERE organization_id=? ORDER BY rowid DESC LIMIT ?`).all(ORG, limit + 1)
+        WHERE organization_id=? ORDER BY rowid DESC LIMIT ?`).all(orgId, limit + 1)
     : db.prepare(`SELECT rowid,id,action,object_id,details,created_at FROM audit_logs
-        WHERE organization_id=? AND rowid<? ORDER BY rowid DESC LIMIT ?`).all(ORG, before, limit + 1);
+        WHERE organization_id=? AND rowid<? ORDER BY rowid DESC LIMIT ?`).all(orgId, before, limit + 1);
   const hasMore = rows.length > limit;
   const page = rows.slice(0, limit);
   return {

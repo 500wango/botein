@@ -7,17 +7,22 @@ export function searchConfig() {
   return { base: (process.env.SEARCH_BASE_URL || DEFAULT_BASE).replace(/\/+$/, '') };
 }
 
-export async function searchWeb(query, { limit = 10 } = {}) {
+export async function searchWeb(query, { limit = 10, signal } = {}) {
+  if (signal?.aborted) throw new AppError(499, 'RESEARCH_CANCELLED', '搜索任务已取消。');
   const { base } = searchConfig();
   const url = new URL(`${base}/search`);
   url.searchParams.set('q', query);
   url.searchParams.set('format', 'json');
   url.searchParams.set('language', 'en');
   url.searchParams.set('safesearch', '0');
+  const fetchSignal = signal ? AbortSignal.any([AbortSignal.timeout(15_000), signal]) : AbortSignal.timeout(15_000);
   let response;
   try {
-    response = await fetch(url, { signal: AbortSignal.timeout(15_000), headers: { Accept: 'application/json' } });
-  } catch {
+    response = await fetch(url, { signal: fetchSignal, headers: { Accept: 'application/json' } });
+  } catch (error) {
+    if (error?.name === 'AbortError' || signal?.aborted) {
+      throw new AppError(499, 'RESEARCH_CANCELLED', '搜索任务已取消。');
+    }
     throw new AppError(503, 'SEARCH_UNAVAILABLE', '本地搜索服务不可用，请确认 SearXNG 已启动。');
   }
   if (!response.ok) throw new AppError(503, 'SEARCH_UNAVAILABLE', `本地搜索服务返回 ${response.status}。`);

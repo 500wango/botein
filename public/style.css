@@ -230,3 +230,18 @@
 @media(max-width:680px) { .sn-auth { padding:24px 20px; } .sn-auth-panel { margin-top:40px; } .sn-workspace .sn-button { margin-left:0; padding:8px; } }
 .sn-session-row { margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--vbg-border-default); overflow-wrap: anywhere; }
 .sn-session-row p { line-height: 1.7; }
+.sn-badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: var(--vbg-radius-small); font-size: var(--vbg-type-label); border: 1px solid var(--vbg-border-strong); color: var(--vbg-text-secondary); }
+.sn-fit-eligible { border-color: var(--vbg-text-primary); color: var(--vbg-text-primary); font-weight: var(--vbg-weight-medium); }
+.sn-fit-notfit { color: var(--vbg-color-error); border-color: var(--vbg-color-error); }
+.sn-fit-list { margin: 12px 0 0; padding-left: 20px; font-size: var(--vbg-type-label); line-height: 1.8; color: var(--vbg-text-secondary); }
+.sn-term-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 14px; border: 1px solid var(--vbg-border-default); border-radius: var(--vbg-radius-small); margin-bottom: 12px; }
+.sn-term-row .sn-term-wide { grid-column: 1 / -1; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.sn-stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin: 18px 0; }
+.sn-stat-card { padding: 14px 16px; border: 1px solid var(--vbg-border-default); border-radius: var(--vbg-radius-small); background: var(--vbg-surface-secondary); }
+.sn-stat-card strong { display: block; font-size: var(--vbg-type-subsection); font-variant-numeric: tabular-nums; margin-top: 4px; }
+.sn-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; }
+.sn-field-grow { flex: 1; margin-bottom: 0; }
+.sn-assign-bar { margin: 12px 0; }
+.sn-field-inline { flex-direction: row; align-items: center; margin: 0; gap: 10px; }
+.sn-select-compact { width: auto; min-height: 36px; }
+@media (max-width: 680px) { .sn-term-row { grid-template-columns: minmax(0, 1fr); } }

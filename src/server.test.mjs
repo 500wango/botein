@@ -1,15 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createApplication } from './server.mjs';
 import { htmlToText, isBlockedAddress } from './source-fetch.mjs';
-import { backupDatabase } from './maintenance.mjs';
+import { extractJsonObject } from './model.mjs';
+import { recoverInterruptedResearchJobs } from './store.mjs';
+import { backupDatabase, verifyBackup } from './maintenance.mjs';
 import { pageParams } from './pagination.mjs';
 import { sourceMatchesHost } from './sources.mjs';
+import { generateTotp, sealSecret, unsealSecret, kmsStatus } from './kms.mjs';
+import { runWorkerTick } from './worker.mjs';
+import { queryExternalContactsConnector } from './connectors.mjs';
+import { exportPostgresDdl, getStorageConfig } from './storage.mjs';
+import { rewritePlaceholders, translateSqliteToPostgres } from './pg-store.mjs';
 
 const fixturePassword = randomUUID() + randomUUID();
 const offlineServices = {
@@ -430,7 +437,7 @@ test('evidence CSV guard: invalid attribution and timestamps fail by row; export
     assert.equal((await app.request('/evidence')).body.items.length, 1);
     assert.equal((await app.request('/evidence/imports', 'POST', { csv: 'account_id,raw_text\nA,B' })).status, 422);
     assert.equal((await app.request('/evidence/imports', 'POST', { csv: 'account_id,source_url,raw_text,observed_at\n"unclosed' })).status, 422);
-    app.db.prepare('INSERT INTO organizations VALUES (?,?)').run('other-org','Other');
+    app.db.prepare('INSERT INTO organizations (id, name) VALUES (?,?)').run('other-org','Other');
     app.db.prepare('INSERT INTO accounts (id,organization_id,brand_name,normalized_name,website,normalized_domain,headquarters_country,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?)').run('other-account','other-org','PRIVATE OTHER BRAND','other','https://example.net','example.net','','hidden',now);
     const exported = await (await app.fetch('/exports/accounts')).text();
     assert.ok(!exported.includes('PRIVATE OTHER BRAND')); assert.ok(!exported.includes('other-account'));
@@ -544,7 +551,7 @@ test('contact edit guards preserve suppression and reject channel changes, stale
     const duplicate=(await app.request('/contacts','POST',{account_id:item.account_id,full_name:'Again',email:person.email,source_url:person.source_url})).body;
     assert.equal(duplicate.id,person.id); assert.equal(duplicate.suppression_reason,changed.suppression_reason);
     assert.equal((await app.request('/contact-suppressions')).body.items[0].email,person.email);
-    app.db.prepare('INSERT INTO organizations VALUES (?,?)').run('private-org','Private');
+    app.db.prepare('INSERT INTO organizations (id, name) VALUES (?,?)').run('private-org','Private');
     app.db.prepare('INSERT INTO accounts (id,organization_id,brand_name,normalized_name,website,normalized_domain,headquarters_country,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?)').run('private-brand','private-org','Private','private','https://example.net','example.net','','',new Date().toISOString());
     app.db.prepare('INSERT INTO contacts (id,organization_id,account_id,full_name,job_title,email,source_url,created_at) VALUES (?,?,?,?,?,?,?,?)').run('private-contact','private-org','private-brand','Hidden','','hidden@example.net','https://example.net',new Date().toISOString());
     assert.equal((await app.request('/contacts/private-contact')).status,404);
@@ -664,9 +671,9 @@ test('session guards: anonymous, foreign and expired targets fail without revoki
     assert.equal((await app.request('/auth/sessions/revoke-others', 'POST', { confirmed: true }, { Cookie: '' })).status, 401);
     assert.equal((await app.request(`/auth/sessions/${current.id}/revoke`, 'POST', {})).status, 422);
     assert.equal((await app.request(`/auth/sessions/${current.id}/revoke`, 'POST', { confirmed: true }, { Origin: 'https://external.example' })).status, 403);
-    app.db.prepare('INSERT INTO organizations VALUES (?,?)').run('session-other-org', 'Other');
+    app.db.prepare('INSERT INTO organizations (id, name) VALUES (?,?)').run('session-other-org', 'Other');
     const own = app.db.prepare('SELECT * FROM local_owners').get();
-    app.db.prepare('INSERT INTO local_owners VALUES (?,?,?,?,?,?,?,?)').run('session-other-owner','session-other-org','other','Other',own.password_hash,own.password_salt,1,new Date().toISOString());
+    app.db.prepare('INSERT INTO local_owners (id,organization_id,username,display_name,password_hash,password_salt,credential_version,created_at) VALUES (?,?,?,?,?,?,?,?)').run('session-other-owner','session-other-org','other','Other',own.password_hash,own.password_salt,1,new Date().toISOString());
     const otherId = randomUUID(), expiredId = randomUUID();
     app.db.prepare('INSERT INTO auth_sessions (token_hash,owner_id,created_at,expires_at,public_id) VALUES (?,?,?,?,?)').run('foreign-hash','session-other-owner',new Date().toISOString(),'2999-01-01T00:00:00Z',otherId);
     app.db.prepare('INSERT INTO auth_sessions (token_hash,owner_id,created_at,expires_at,public_id) VALUES (?,?,?,?,?)').run('expired-hash',own.id,'2000-01-01T00:00:00Z','2000-01-02T00:00:00Z',expiredId);
@@ -1042,6 +1049,51 @@ test('AI evidence analysis validates quotes, stores assessments and redacts on p
   } finally { await app.close(); }
 });
 
+test('contact discovery only accepts emails printed on the brand website and leaves them unverified', async () => {
+  let calls = 0;
+  const contact = {
+    email: 'sales@contact-brand.example.com', full_name: '', job_title: 'Sales',
+    source_url: 'https://contact-brand.example.com/contact', evidence_excerpt: 'Contact our Sales team',
+  };
+  const services = {
+    ...offlineServices,
+    searchStatus: async () => ({ configured: true, reachable: true, base: 'stub' }),
+    modelConfig: () => ({ configured: true, name: 'stub-model' }),
+    searchWeb: async () => [{ title: 'Contact', url: contact.source_url, content: 'Contact our Sales team at sales@contact-brand.example.com.' }],
+    fetchPage: async () => ({
+      final_url: contact.source_url, requested_url: contact.source_url, status_code: 200, content_type: 'text/html',
+      text: 'Contact our Sales team for wholesale questions.', byte_length: 100,
+      redirect_count: 0, redirect_chain: [], fetched_at: new Date().toISOString(), truncated: false,
+      extraction: 'SIMPLE_TAG_STRIP', metadata: { title: 'Contact', site_name: 'Contact Brand', description: '', emails: [contact.email] },
+    }),
+    completeJson: async () => {
+      calls++;
+      return {
+        data: { contacts: calls < 3 ? [contact] : [{ ...contact, email: 'fake@other.example' }] },
+        usage: {}, model: 'stub-model',
+      };
+    },
+  };
+  const app = await runApp(':memory:', { services });
+  try {
+    const brand = (await app.request('/accounts', 'POST', { brand_name: 'Contact Brand', website: 'https://contact-brand.example.com' })).body;
+    const discovered = await app.request(`/accounts/${brand.id}/contacts/discover`, 'POST', {});
+    assert.equal(discovered.status, 200, JSON.stringify(discovered.body));
+    assert.equal(discovered.body.counts.created, 1);
+    const contacts = (await app.request('/contacts')).body.items;
+    assert.equal(contacts.length, 1);
+    assert.equal(contacts[0].email, contact.email);
+    assert.equal(contacts[0].verification_status, 'UNVERIFIED');
+    assert.equal(contacts[0].source_url, contact.source_url);
+    const reused = await app.request(`/accounts/${brand.id}/contacts/discover`, 'POST', {});
+    assert.equal(reused.body.counts.created, 0); assert.equal(reused.body.counts.reused, 1);
+    const rejected = await app.request(`/accounts/${brand.id}/contacts/discover`, 'POST', {});
+    assert.equal(rejected.body.counts.created, 0); assert.equal(rejected.body.contacts.length, 0);
+    assert.equal((await app.request('/contacts')).body.items.length, 1);
+    assert.ok(app.db.prepare("SELECT id FROM audit_logs WHERE action='CONTACT_DISCOVERY_RUN'").all().length > 0);
+  } finally { await app.close(); }
+});
+
 test('research cancellation stops a running discovery job without saving results', async () => {
   const services = {
     ...offlineServices,
@@ -1126,10 +1178,28 @@ test('discovery research uses search and model to create unverified candidates o
       redirect_chain: [], fetched_at: new Date().toISOString(), truncated: false,
       extraction: 'SIMPLE_TAG_STRIP', metadata: { title: 'Acme Pods', site_name: 'Acme Pods', description: 'Laundry pods sold in the US.' },
     }),
-    completeJson: async () => ({
-      data: { candidates: [{ domain: 'acme-pods.example.com', brand_name: 'Acme Pods', is_brand: true, product_signal: 'YES', us_signal: 'YES', reason: 'Brand site', evidence_excerpt: 'Laundry pods sold in the US.' }] },
-      usage: { cost: 0.001 }, model: 'stub-model',
-    }),
+    completeJson: async ({ prompt } = {}) => {
+      if (String(prompt).includes('extracted text of an external web page')) {
+        return {
+          data: {
+            event_type: 'PRODUCT_LAUNCH', intent_signal: 'INDIRECT', uncertainty: 'LOW',
+            observed_facts: [{ text: 'Brand offers laundry pods in the US.', quote: 'Laundry pods sold in the US.' }],
+            business_hypotheses: [], missing_information: ['MOQ not disclosed'],
+          },
+          usage: { inputTokens: 120, outputTokens: 60 }, model: 'stub-model',
+        };
+      }
+      if (String(prompt).includes('contacts')) {
+        return {
+          data: { contacts: [{ full_name: 'Buying Team', job_title: 'Procurement', department: 'Sourcing', role_relevance: 'PROCUREMENT', email: 'buying@acme-pods.example.com', source_url: 'https://acme-pods.example.com/' }] },
+          usage: { inputTokens: 90, outputTokens: 40 }, model: 'stub-model',
+        };
+      }
+      return {
+        data: { candidates: [{ domain: 'acme-pods.example.com', brand_name: 'Acme Pods', is_brand: true, product_signal: 'YES', us_signal: 'YES', reason: 'Brand site', evidence_excerpt: 'Laundry pods sold in the US.' }] },
+        usage: { inputTokens: 150, outputTokens: 80, cost: 0.001 }, model: 'stub-model',
+      };
+    },
     modelConfig: () => ({ configured: true, name: 'stub-model' }),
     searchBase: 'stub',
   };
@@ -1146,17 +1216,23 @@ test('discovery research uses search and model to create unverified candidates o
     const job = await waitForJob(app, created.body.id);
     assert.equal(job.status, 'COMPLETED');
     assert.equal(job.counts.discovered, 1); assert.equal(job.counts.processed, 1);
-    assert.equal(job.counts.new_opportunities, 0);
+    assert.equal(job.counts.new_opportunities, 1);
     assert.equal(job.details.model, 'stub-model');
     const accounts = (await app.request('/accounts')).body.items;
     assert.equal(accounts.length, 1); assert.equal(accounts[0].brand_name, 'Acme Pods');
     const evidence = (await app.request('/evidence')).body.items;
     assert.equal(evidence.length, 1); assert.equal(evidence[0].verification_status, 'UNVERIFIED');
+    assert.equal(evidence[0].source_kind, 'FIRST_PARTY_BRAND');
     assert.match(evidence[0].raw_text, /Laundry pods sold in the US/);
+    const opps = (await app.request('/opportunities')).body.items;
+    assert.equal(opps.length, 1);
+    assert.equal(opps[0].qualification_status, 'NEW');
+    assert.ok(opps[0].fit_status);
     const results = (await app.request(`/research-jobs/${job.id}/results`)).body;
     assert.equal(results.items.length, 1); assert.equal(results.items[0].tier, 'NEEDS_INFORMATION');
-    assert.equal(results.items[0].opportunity_id, null);
-    assert.equal((await app.request('/opportunities')).body.items.length, 0);
+    assert.equal(results.items[0].opportunity_id, opps[0].id);
+    const aiRuns = (await app.request('/ai-runs')).body;
+    assert.ok(aiRuns.summary.total_runs >= 1);
     assert.ok(Array.isArray((await app.request(`/research-jobs/${job.id}/failures`)).body.items));
   } finally { await app.close(); }
 });
@@ -1239,4 +1315,830 @@ test('audit log pagination is newest-first and never exposes credentials', async
     assert.equal((await app.request('/audit-logs?limit=101')).status, 422);
     assert.equal((await app.request('/audit-logs?cursor=bad')).status, 422);
   } finally { await app.close(); }
+});
+
+test('pool PRIORITY_REVIEW requires verified category evidence without QUALIFIED gate and evaluates fit rules + quality levels', async () => {
+  const app = await runApp(':memory:');
+  try {
+    const p = (await app.request('/workspace')).body.factory;
+    const saved = (await app.request('/factory-profile', 'PUT', {
+      ...p,
+      target_markets: ['US'],
+      prohibited_markets: ['EU'],
+      certifications: ['ISO9001', 'EPA Safer Choice'],
+      moq_quantity: 5000,
+      unit: 'POD',
+      packaging_spec: '4-chamber custom film',
+      lead_time_days: 30,
+      production_terms: [{ product_category: 'LAUNDRY_PODS', min_moq: 5000, max_moq: 50000, unit: 'POD', packaging_spec: 'Custom film', lead_time_days: 30 }],
+      expected_version: p.version,
+    })).body;
+    assert.equal(saved.prohibited_markets[0], 'EU');
+    assert.equal(saved.certifications.length, 2);
+    assert.equal(saved.production_terms.length, 1);
+    await app.request('/factory-profile/activate', 'POST', { expected_version: saved.version, confirmed: true });
+
+    // Eligible brand with verified FIRST_PARTY_BRAND evidence and a NEW opportunity (not QUALIFIED!)
+    const brandA = (await app.request('/accounts', 'POST', { brand_name: 'FirstParty Pods', website: 'https://firstparty.example.com', headquarters_country: 'US' })).body;
+    const prodA = (await app.request(`/accounts/${brandA.id}/products`, 'POST', {
+      product_name: 'Pure Pods', product_category: 'LAUNDRY_PODS', product_url: 'https://firstparty.example.com/pods',
+    })).body;
+    const evA = (await app.request('/evidence', 'POST', {
+      account_id: brandA.id, product_id: prodA.id, source_url: 'https://firstparty.example.com/pods',
+      source_kind: 'FIRST_PARTY_BRAND', availability_status: 'AVAILABLE',
+      published_at: '2026-10-01', raw_text: 'Pure laundry pods available in US stores.',
+    })).body;
+    await app.request(`/evidence/${evA.id}/verify`, 'POST', { expected_version: evA.version, reason: '核对官方官网。', confirmed: true });
+    const oppA = (await app.request('/opportunities', 'POST', { account_id: brandA.id, reason: 'US laundry pods brand with verified first-party evidence' })).body;
+    assert.equal(oppA.qualification_status, 'NEW');
+    assert.equal(oppA.fit_status, 'ELIGIBLE');
+    assert.ok(oppA.fit_checks.some(c => c.code === 'CERTIFICATIONS' && c.status === 'PASS'));
+    assert.ok(oppA.fit_checks.some(c => c.code === 'BASE_EVIDENCE' && c.status === 'PASS'));
+
+    // Prohibited market brand => NOT_FIT
+    const brandB = (await app.request('/accounts', 'POST', { brand_name: 'Euro Brand', website: 'https://euro.example.com', headquarters_country: 'EU' })).body;
+    const oppB = (await app.request('/opportunities', 'POST', { account_id: brandB.id, reason: 'Check prohibited market' })).body;
+    assert.equal(oppB.fit_status, 'NOT_FIT');
+
+    // US brand with verified EXPIRED evidence => LOW quality, NEEDS_INFORMATION under HIGH threshold
+    const brandC = (await app.request('/accounts', 'POST', { brand_name: 'Expired Pods', website: 'https://expired.example.com', headquarters_country: 'US' })).body;
+    const prodC = (await app.request(`/accounts/${brandC.id}/products`, 'POST', {
+      product_name: 'Old Pods', product_category: 'LAUNDRY_PODS', product_url: 'https://expired.example.com/pods',
+    })).body;
+    const evC = (await app.request('/evidence', 'POST', {
+      account_id: brandC.id, product_id: prodC.id, source_url: 'https://expired.example.com/pods',
+      source_kind: 'FIRST_PARTY_BRAND', availability_status: 'EXPIRED',
+      raw_text: 'Discontinued US pods listing.',
+    })).body;
+    await app.request(`/evidence/${evC.id}/verify`, 'POST', { expected_version: evC.version, reason: '已核实失效页面。', confirmed: true });
+
+    // Run POOL research with HIGH threshold: brandA gets PRIORITY_REVIEW even though opportunity is NEW; brandB is NOT_FIT; expired brandC gets LOW/NEEDS_INFORMATION
+    const jobRes = await app.request('/research-jobs', 'POST', { market: 'US', quantity: 10, source_mode: 'POOL', min_evidence_quality: 'HIGH' });
+    assert.equal(jobRes.status, 202);
+    const job = await waitForJob(app, jobRes.body.id);
+    assert.equal(job.status, 'COMPLETED');
+    const results = (await app.request(`/research-jobs/${job.id}/results`)).body.items;
+    const itemA = results.find(r => r.account_id === brandA.id);
+    const itemB = results.find(r => r.account_id === brandB.id);
+    const itemC = results.find(r => r.account_id === brandC.id);
+    assert.equal(itemA.tier, 'PRIORITY_REVIEW');
+    assert.equal(itemA.evidence.quality, 'HIGH');
+    assert.equal(itemB.tier, 'NOT_FIT');
+    assert.equal(itemC.tier, 'NEEDS_INFORMATION');
+    assert.equal(itemC.evidence.quality, 'LOW');
+
+    // Opportunities filter & search
+    const filtered = (await app.request('/opportunities?fit_status=ELIGIBLE&q=FirstParty')).body.items;
+    assert.equal(filtered.length, 1);
+    assert.equal(filtered[0].id, oppA.id);
+  } finally { await app.close(); }
+});
+
+test('research crash recovery, active DISCOVERY lock, and retry budget exhaustion', async () => {
+  let holdResolve;
+  const holdPromise = new Promise(resolve => { holdResolve = resolve; });
+  const services = {
+    searchStatus: async () => ({ configured: true, reachable: true, base: 'stub' }),
+    searchWeb: async () => { await holdPromise; return []; },
+    fetchPage: async () => { throw new Error('offline'); },
+    completeJson: async () => ({ data: { candidates: [] }, usage: {}, model: 'stub-model' }),
+    modelConfig: () => ({ configured: true, name: 'stub-model' }),
+    searchBase: 'stub',
+  };
+  const app = await runApp(':memory:', { services });
+  try {
+    const p = (await app.request('/workspace')).body.factory;
+    const saved = (await app.request('/factory-profile', 'PUT', { ...p, target_markets: ['US'], expected_version: p.version })).body;
+    await app.request('/factory-profile/activate', 'POST', { expected_version: saved.version, confirmed: true });
+
+    // Seed an orphaned RUNNING job and test startup recovery
+    const orphanId = randomUUID();
+    const now = new Date().toISOString();
+    app.db.prepare(`INSERT INTO research_jobs
+      (id,organization_id,status,current_step,attempt,stop_reason,input_snapshot,factory_version,source_mode,counts,budget,details,created_at,started_at,finished_at,version)
+      VALUES (?,?,'RUNNING','DISCOVERING',1,NULL,'{}',?, 'POOL','{}','{}','{}',?,?,NULL,1)`)
+      .run(orphanId, 'local-lancco', saved.version, now, now);
+    const recovered = recoverInterruptedResearchJobs(app.db);
+    assert.equal(recovered, 1);
+    const orphan = (await app.request(`/research-jobs/${orphanId}`)).body;
+    assert.equal(orphan.status, 'FAILED');
+    assert.equal(orphan.stop_reason, 'SERVER_RESTARTED');
+
+    // Retry budget exhausted check (409)
+    app.db.prepare("UPDATE research_jobs SET budget=? WHERE id=?").run(JSON.stringify({
+      limits: { search_requests: 50, page_requests: 200, runtime_ms: 1_800_000, cost_usd: 5 },
+      usage: { search_requests: 50, page_requests: 0, runtime_ms: 0, cost_usd: 0 },
+    }), orphanId);
+    const exhaustedRetry = await app.request(`/research-jobs/${orphanId}/retry`, 'POST', {});
+    assert.equal(exhaustedRetry.status, 409);
+
+    // Concurrent DISCOVERY job lock (409)
+    const first = await app.request('/research-jobs', 'POST', { market: 'US', quantity: 5, source_mode: 'DISCOVERY' });
+    assert.equal(first.status, 202);
+    const second = await app.request('/research-jobs', 'POST', { market: 'US', quantity: 5, source_mode: 'DISCOVERY' });
+    assert.equal(second.status, 409);
+    await app.request(`/research-jobs/${first.body.id}/cancel`, 'POST', {});
+    holdResolve();
+    await waitForJob(app, first.body.id);
+  } finally {
+    holdResolve?.();
+    await app.close();
+  }
+});
+
+test('draft review rejects terminal states and enforces active matching product category', async () => {
+  const app = await runApp(':memory:');
+  try {
+    const { item, proof, person, draft } = await prepareDraft(app);
+    // Reject draft, then attempt invalid second review => 409 INVALID_TRANSITION
+    const rejected = await app.request(`/drafts/${draft.id}/review`, 'POST', {
+      expected_version: draft.version, draft_version_id: draft.current_version_id,
+      action: 'REJECT', reason: '表达需调整，退回重写。',
+    });
+    assert.equal(rejected.status, 200);
+    assert.equal(rejected.body.status, 'REJECTED');
+    const invalidRetry = await app.request(`/drafts/${draft.id}/review`, 'POST', {
+      expected_version: rejected.body.version, draft_version_id: rejected.body.current_version_id,
+      action: 'APPROVE', reason: '试图直接批准已拒绝版本。', full_text_confirmed: true, claims_confirmed: true,
+    });
+    assert.equal(invalidRetry.status, 409);
+
+    // Evidence tied to ARCHIVED or wrong-category product cannot be cited in a draft
+    const wrongProd = (await app.request(`/accounts/${item.account_id}/products`, 'POST', {
+      product_name: 'Dish Tabs', product_category: 'DISHWASHER_TABLETS', product_url: 'https://example.com/dish',
+    })).body;
+    const wrongEv = (await app.request('/evidence', 'POST', {
+      account_id: item.account_id, product_id: wrongProd.id,
+      source_url: 'https://example.com/dish', raw_text: 'Dishwasher tablets sold in the US.',
+    })).body;
+    await app.request(`/evidence/${wrongEv.id}/verify`, 'POST', { expected_version: wrongEv.version, reason: '已核验非凝珠品类。', confirmed: true });
+    const badDraft = await app.request(`/opportunities/${item.id}/drafts`, 'POST', {
+      contact_id: person.id,
+      subject: 'Dishwasher Inquiry',
+      body: 'We noticed you offer Dishwasher tablets sold in the US.',
+      claims: [{ text: 'We noticed you offer Dishwasher tablets sold in the US.', kind: 'EVIDENCE', evidence_id: wrongEv.id, quote: 'Dishwasher tablets sold in the US.' }],
+    });
+    assert.equal(badDraft.status, 422);
+    assert.ok(proof.id);
+  } finally { await app.close(); }
+});
+
+test('htmlToText extended entities, extractJsonObject braces in strings, and same-ms NEEDS_EVIDENCE transition', async () => {
+  const cleaned = htmlToText('<p>Brand&copy; &trade;Pods &mdash; Fast&rsquo;s clean&hellip;</p>');
+  assert.equal(cleaned.text, 'Brand© ™Pods — Fast’s clean…');
+  const parsed = extractJsonObject('prefix {"text":"brace } inside string { here","ok":true} trailing');
+  assert.equal(parsed.text, 'brace } inside string { here');
+  assert.equal(parsed.ok, true);
+
+  const app = await runApp(':memory:');
+  try {
+    const p = (await app.request('/workspace')).body.factory;
+    const saved = (await app.request('/factory-profile', 'PUT', { ...p, target_markets: ['US'], expected_version: p.version })).body;
+    await app.request('/factory-profile/activate', 'POST', { expected_version: saved.version, confirmed: true });
+    const brand = (await app.request('/accounts', 'POST', { brand_name: 'SameMs Pods', website: 'https://samems.example.com' })).body;
+    const ev = (await app.request('/evidence', 'POST', {
+      account_id: brand.id, source_url: 'https://samems.example.com/pods', raw_text: 'Laundry pods sold in US.',
+    })).body;
+    const opp = (await app.request('/opportunities', 'POST', { account_id: brand.id, reason: 'Initial lead' })).body;
+    const reqEv = (await app.request(`/opportunities/${opp.id}/transitions`, 'POST', {
+      expected_version: opp.version, action: 'REQUEST_EVIDENCE', reason: '请核验证据后恢复审核。',
+    })).body;
+    assert.equal(reqEv.qualification_status, 'NEEDS_EVIDENCE');
+    // Force identical updated_at timestamp to verify audit_logs.rowid fallback works even within same millisecond
+    const verifyRes = await app.request(`/evidence/${ev.id}/verify`, 'POST', { expected_version: ev.version, reason: '核验原文。', confirmed: true });
+    assert.equal(verifyRes.status, 200);
+    app.db.prepare('UPDATE opportunities SET updated_at=? WHERE id=?').run(verifyRes.body.checked_at, opp.id);
+    const startReview = await app.request(`/opportunities/${opp.id}/transitions`, 'POST', {
+      expected_version: reqEv.version, action: 'START_REVIEW', reason: '已完成新核验。',
+    });
+    assert.equal(startReview.status, 200, JSON.stringify(startReview.body));
+    assert.equal(startReview.body.qualification_status, 'REVIEWING');
+  } finally { await app.close(); }
+});
+
+test('multi-user RBAC isolates OWNER-only writes, revokes disabled members, and supports controlled suppression lift', async () => {
+  const app = await runApp(':memory:');
+  try {
+    const { item, person } = await prepareDraft(app);
+    // Suppress contact email (prepareDraft verified person, bumping version to 2)
+    const currentPerson = (await app.request(`/contacts/${person.id}`)).body;
+    const sup = await app.request(`/contacts/${person.id}/suppress`, 'POST', { expected_version: currentPerson.version, reason: '对方邮件明确要求退订。' });
+    assert.equal(sup.status, 200);
+
+    // Create MEMBER user as OWNER
+    const memberPwd = 'member-pass-12345';
+    const createdMember = await app.request('/auth/members', 'POST', {
+      username: 'sales-rep', display_name: 'Sales Rep', password: memberPwd, role: 'MEMBER',
+    });
+    assert.equal(createdMember.status, 201, JSON.stringify(createdMember.body));
+
+    // Login as MEMBER using separate cookie jar
+    const memberLogin = await fetch(`${app.base}/api/v1/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'sales-rep', password: memberPwd }),
+    });
+    assert.equal(memberLogin.status, 200);
+    const memberCookie = memberLogin.headers.get('set-cookie').split(';')[0];
+    const memberReq = async (path, method = 'GET', body) => {
+      const res = await fetch(`${app.base}/api/v1${path}`, {
+        method,
+        headers: { Cookie: memberCookie, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: res.status, body: await res.json() };
+    };
+
+    // MEMBER can assign opportunity to self, create accounts, etc.
+    const assigned = await memberReq(`/opportunities/${item.id}/assign`, 'PATCH', {
+      expected_version: (await memberReq(`/opportunities/${item.id}`)).body.version,
+      assigned_to: 'sales-rep',
+    });
+    assert.equal(assigned.status, 200, JSON.stringify(assigned.body));
+    assert.equal(assigned.body.assigned_to, 'sales-rep');
+
+    // MEMBER is forbidden on OWNER-only routes
+    assert.equal((await memberReq('/auth/members')).status, 403);
+    assert.equal((await memberReq('/sources', 'POST', { name: 'ForbiddenSrc' })).status, 403);
+    assert.equal((await memberReq('/contact-suppressions/lift', 'POST', { email: person.email, reason: '未经授权尝试解除', confirmed: true })).status, 403);
+    const p = (await memberReq('/workspace')).body.factory;
+    assert.equal((await memberReq('/factory-profile', 'PUT', { ...p, expected_version: p.version })).status, 403);
+
+    // OWNER lifts suppression safely => contact marked STALE
+    const lifted = await app.request('/contact-suppressions/lift', 'POST', {
+      email: person.email, reason: '客户法务发来书面恢复联系确认。', confirmed: true,
+    });
+    assert.equal(lifted.status, 200);
+    const oppAfterLift = (await app.request(`/opportunities/${item.id}`)).body;
+    const contactAfter = oppAfterLift.contacts.find(c => c.id === person.id);
+    assert.equal(contactAfter.suppression_reason, null);
+    assert.equal(contactAfter.verification_status, 'STALE');
+
+    // OWNER disables MEMBER => MEMBER session immediately fails with 401
+    const disabled = await app.request(`/auth/members/${createdMember.body.id}`, 'PATCH', { status: 'DISABLED' });
+    assert.equal(disabled.status, 200);
+    assert.equal((await memberReq('/workspace')).status, 401);
+  } finally { await app.close(); }
+});
+
+test('discovery step 6 drafting, mid-flight budget persistence, TIME_LIMIT and multi-page aggregation', async () => {
+  let fetchMode = 'MULTI_OK';
+  const fetchedUrls = [];
+  const services = {
+    searchWeb: async () => {
+      if (fetchMode === 'SLOW_TIME_LIMIT') await new Promise(r => setTimeout(r, 30));
+      return [{ url: 'https://pods-co.example.com/shop/pods', title: 'Pods Co Shop', content: 'Concentrated laundry pods available in US stores now.' }];
+    },
+    searchStatus: async () => ({ configured: true, reachable: true, base: 'stub' }),
+    fetchPage: async url => {
+      fetchedUrls.push(url);
+      if (fetchMode === 'FAIL_MIDFLIGHT') throw new Error('fetch_page_timeout');
+      if (url.endsWith('/')) {
+        return {
+          final_url: url, status_code: 200, content_type: 'text/html',
+          text: 'About Pods Co wholesale and private label contact sales@pods-co.example.com.',
+          byte_length: 120, redirect_count: 0, redirect_chain: [], fetched_at: new Date().toISOString(), truncated: false,
+          metadata: { title: 'Pods Co Home', site_name: 'Pods Co', description: 'Wholesale laundry pods.' },
+        };
+      }
+      return {
+        final_url: url, status_code: 200, content_type: 'text/html',
+        text: 'Concentrated laundry pods available in US stores now. Contact hello@pods-co.example.com for retail buyers.',
+        byte_length: 160, redirect_count: 0, redirect_chain: [], fetched_at: new Date().toISOString(), truncated: false,
+        metadata: { title: 'Pods Co Shop', site_name: 'Pods Co', description: 'Laundry pods US.' },
+      };
+    },
+    completeJson: async ({ prompt }) => {
+      const textPrompt = String(prompt);
+      if (textPrompt.includes('extracted text of an external web page')) {
+        return {
+          data: {
+            event_type: 'PRODUCT_LAUNCH', intent_signal: 'EXPLICIT_BRAND_FIT', uncertainty: 'LOW',
+            observed_facts: [{ text: 'Pods available in US stores.', quote: 'Concentrated laundry pods available in US stores now.' }],
+            business_hypotheses: [], missing_information: ['MOQ'],
+          },
+          usage: { inputTokens: 80, outputTokens: 40, cost: 0.0008 }, model: 'stub-model',
+        };
+      }
+      if (textPrompt.includes('contacts')) {
+        return {
+          data: { contacts: [{ full_name: 'Buyer Lead', job_title: 'Head of Buying', department: 'Buying', role_relevance: 'PROCUREMENT', email: 'hello@pods-co.example.com', source_url: 'https://pods-co.example.com/shop/pods' }] },
+          usage: { inputTokens: 70, outputTokens: 30, cost: 0.0006 }, model: 'stub-model',
+        };
+      }
+      if (textPrompt.includes('VERIFIED EVIDENCE:')) {
+        const evMatch = textPrompt.match(/EVIDENCE ([0-9a-f-]{36})/i);
+        const evId = evMatch ? evMatch[1] : '';
+        return {
+          data: {
+            subject: 'OEM Laundry Pods Partnership Inquiry',
+            body: 'Hello, we noticed your concentrated laundry pods currently sold in US stores.',
+            claims: [
+              { text: 'concentrated laundry pods currently sold in US stores', kind: 'EVIDENCE', evidence_id: evId, quote: 'Concentrated laundry pods available in US stores now.' },
+            ],
+          },
+          usage: { inputTokens: 90, outputTokens: 50, cost: 0.001 }, model: 'stub-model',
+        };
+      }
+      return {
+        data: { candidates: [{ domain: 'pods-co.example.com', brand_name: 'Pods Co', is_brand: true, product_signal: 'YES', market_signal: 'YES', reason: 'Strong US laundry pod brand', evidence_excerpt: 'Concentrated laundry pods available in US stores now.' }] },
+        usage: { inputTokens: 120, outputTokens: 60, cost: 0.0012 }, model: 'stub-model',
+      };
+    },
+    modelConfig: () => ({ configured: true, name: 'stub-model' }),
+    searchBase: 'stub',
+  };
+  const app = await runApp(':memory:', { services });
+  try {
+    const p = (await app.request('/workspace')).body.factory;
+    const saved = (await app.request('/factory-profile', 'PUT', { ...p, target_markets: ['US'], expected_version: p.version })).body;
+    await app.request('/factory-profile/activate', 'POST', { expected_version: saved.version, confirmed: true });
+    await app.request('/factory-profile/checks', 'POST', { expected_version: saved.version + 1, field: 'supported_products', reason: 'Verified pods capability', confirmed: true });
+
+    // 1. Complete discovery pipeline including Step 6 candidate DRAFT creation & multi-page merge
+    const created = await app.request('/research-jobs', 'POST', { market: 'US', quantity: 5, auto_draft: true });
+    assert.equal(created.status, 202);
+    const job = await waitForJob(app, created.body.id);
+    assert.equal(job.status, 'COMPLETED', JSON.stringify(job));
+    assert.ok(fetchedUrls.some(u => u.includes('/shop/pods')));
+    assert.ok(fetchedUrls.some(u => u === 'https://pods-co.example.com/' || u === 'https://pods-co.example.com'));
+    const opps = (await app.request('/opportunities')).body.items;
+    assert.equal(opps.length, 1);
+    const drafts = (await app.request(`/opportunities/${opps[0].id}/drafts`)).body.items;
+    assert.equal(drafts.length, 1);
+    assert.equal(drafts[0].status, 'DRAFT');
+    assert.equal(drafts[0].created_by, 'AI');
+    // Unverified candidate draft MUST still be blocked from APPROVE
+    const approveTry = await app.request(`/drafts/${drafts[0].id}/review`, 'POST', {
+      expected_version: drafts[0].version, draft_version_id: drafts[0].current_version_id,
+      action: 'APPROVE', reason: 'Try approve unverified', full_text_confirmed: true, claims_confirmed: true,
+    });
+    assert.equal(approveTry.status, 422);
+
+    // 2. Mid-flight failure persists page requests/usage into job.budget
+    fetchMode = 'FAIL_MIDFLIGHT';
+    const failJobReq = await app.request('/research-jobs', 'POST', { market: 'US', quantity: 5, pool_only_fallback: false });
+    const failJob = await waitForJob(app, failJobReq.body.id);
+    assert.ok(failJob.budget.usage.page_requests > 0 || failJob.budget.usage.search_requests > 0, `expected mid-flight usage persistence, got ${JSON.stringify(failJob.budget)}`);
+
+    // 3. runtime_ms budget stops with TIME_LIMIT
+    fetchMode = 'SLOW_TIME_LIMIT';
+    const timeJobReq = await app.request('/research-jobs', 'POST', { market: 'US', quantity: 5, budget: { runtime_ms: 1 } });
+    const timeJob = await waitForJob(app, timeJobReq.body.id);
+    assert.equal(timeJob.stop_reason, 'TIME_LIMIT');
+  } finally { await app.close(); }
+});
+
+test('reconcileOne restores BLOCKED draft to IN_REVIEW, deterministic time_sensitive claim, structured certs conflict', async () => {
+  let proofId = '';
+  const services = {
+    ...offlineServices,
+    modelConfig: () => ({ configured: true, name: 'stub-model' }),
+    completeJson: async () => ({
+      data: {
+        subject: 'Product availability check',
+        body: 'We noticed your laundry pods are currently sold in US retail.',
+        claims: [
+          { text: 'laundry pods are currently sold in US retail', kind: 'EVIDENCE', evidence_id: proofId, quote: 'Sample branded laundry pods offered in US.' },
+        ],
+      },
+      usage: { inputTokens: 60, outputTokens: 30, cost: 0.0005 }, model: 'stub-model',
+    }),
+  };
+  const app = await runApp(':memory:', { services });
+  try {
+    const { item, person, proof, draft } = await prepareDraft(app);
+    proofId = proof.id;
+    // Test deterministic time_sensitive tagging in generateDraft
+    const aiDraftRes = await app.request(`/opportunities/${item.id}/drafts/generate`, 'POST', {});
+    assert.equal(aiDraftRes.status, 201, JSON.stringify(aiDraftRes.body));
+    assert.equal(aiDraftRes.body.claims[0].time_sensitive, true);
+
+    // Approve manual draft -> suppress contact -> draft transitions to BLOCKED
+    const approved = (await approveDraft(app, draft)).body;
+    assert.equal(approved.status, 'APPROVED');
+    const currentPerson = (await app.request(`/contacts/${person.id}`)).body;
+    const suppRes = await app.request(`/contacts/${person.id}/suppress`, 'POST', { expected_version: currentPerson.version, reason: 'Temp opt-out' });
+    assert.equal(suppRes.status, 200, JSON.stringify(suppRes.body));
+    const blocked = (await app.request(`/drafts/${draft.id}`)).body;
+    assert.equal(blocked.status, 'BLOCKED');
+
+    // Lift suppression & re-verify contact -> reconcileOne unblocks BLOCKED -> IN_REVIEW (never auto-APPROVED)
+    await app.request('/contact-suppressions/lift', 'POST', { email: person.email, reason: 'Written consent received', confirmed: true });
+    const contactStale = (await app.request(`/contacts/${person.id}`)).body;
+    assert.equal(contactStale.verification_status, 'STALE');
+    await app.request(`/contacts/${person.id}/verify`, 'POST', { expected_version: contactStale.version, reason: 'Re-verified email', confirmed: true });
+    const unblocked = (await app.request(`/drafts/${draft.id}`)).body;
+    assert.equal(unblocked.status, 'IN_REVIEW');
+    assert.notEqual(unblocked.status, 'APPROVED');
+
+    // Structured certification expiry triggers CONFLICT in fit_checks
+    const fac = (await app.request('/workspace')).body.factory;
+    const savedFac = (await app.request('/factory-profile', 'PUT', {
+      ...fac,
+      target_markets: ['US'],
+      certifications: [{ name: 'ISO9001', cert_no: 'CN-2020-01', issuer: 'SGS', expires_at: '2020-01-01', attachment_url: 'https://lancco.com/cert.pdf' }],
+      expected_version: fac.version,
+    })).body;
+    await app.request('/factory-profile/activate', 'POST', { expected_version: savedFac.version, confirmed: true });
+    const updatedOpp = (await app.request(`/opportunities/${item.id}`)).body;
+    assert.equal(updatedOpp.fit_status, 'NOT_FIT');
+    assert.ok(updatedOpp.fit_checks.some(c => c.code === 'CERTIFICATIONS' && c.status === 'CONFLICT'));
+  } finally { await app.close(); }
+});
+
+test('follow-up reminders endpoint and funnel analytics multi-dimensional breakdowns', async () => {
+  const app = await runApp(':memory:');
+  try {
+    const { item } = await prepareDraft(app);
+    const currentOpp = (await app.request(`/opportunities/${item.id}`)).body;
+    const assignRes = await app.request(`/opportunities/${item.id}/assign`, 'PATCH', { expected_version: currentOpp.version, assigned_to: 'test-owner' });
+    assert.equal(assignRes.status, 200, JSON.stringify(assignRes.body));
+    const overdueAt = new Date(Date.now() - 3600_000).toISOString();
+    const soonAt = new Date(Date.now() + 3600_000).toISOString();
+    await app.request('/follow-up-tasks', 'POST', { opportunity_id: item.id, title: 'Overdue check', due_at: overdueAt, idempotency_key: randomUUID() });
+    await app.request('/follow-up-tasks', 'POST', { opportunity_id: item.id, title: 'Soon check', due_at: soonAt, idempotency_key: randomUUID() });
+    const reminders = (await app.request('/follow-up-tasks/reminders')).body;
+    assert.equal(reminders.overdue_count, 1);
+    assert.equal(reminders.due_soon_count, 1);
+
+    const b2 = (await app.request('/accounts', 'POST', { brand_name: 'Rejected Brand', website: 'https://rej.example.com' })).body;
+    const o2 = (await app.request('/opportunities', 'POST', { account_id: b2.id, reason: 'Check reject breakdown' })).body;
+    const o2Rev = (await app.request(`/opportunities/${o2.id}/transitions`, 'POST', { action: 'START_REVIEW', expected_version: o2.version, reason: 'Begin review' })).body;
+    const rejRes = await app.request(`/opportunities/${o2.id}/transitions`, 'POST', { action: 'REJECT', expected_version: o2Rev.version, reason: 'MOQ mismatch' });
+    assert.equal(rejRes.status, 200);
+
+    const today = new Date().toISOString().slice(0, 10);
+    const funnel = (await app.request(`/analytics/funnel?from=${today}&to=${today}`)).body;
+    assert.ok(Array.isArray(funnel.breakdowns.by_assignee));
+    assert.ok(funnel.breakdowns.by_assignee.some(r => r.assigned_to === 'test-owner'));
+    assert.ok(funnel.breakdowns.rejection_reasons.some(r => r.reason === 'MOQ mismatch' && r.count === 1));
+  } finally { await app.close(); }
+});
+
+test('multi-org tenant isolation, invitations, password reset, TOTP MFA, KMS, DB rate limit & CORS', async () => {
+  const prevMaster = process.env.KMS_MASTER_KEY;
+  const prevCors = process.env.CORS_ALLOWED_ORIGINS;
+  process.env.KMS_MASTER_KEY = 'unit-test-master-key-32-bytes-ok!!';
+  process.env.CORS_ALLOWED_ORIGINS = 'https://console.example.com';
+
+  const dir = await mkdtemp(join(tmpdir(), 'botein-saas-'));
+  const dbPath = join(dir, 'saas.sqlite');
+  let app = await runApp(dbPath);
+  try {
+    // 1. KMS seal/unseal verification
+    const sealed = sealSecret('super-secret-api-key');
+    assert.notEqual(sealed, 'super-secret-api-key');
+    assert.equal(unsealSecret(sealed), 'super-secret-api-key');
+    assert.equal(kmsStatus().configured_master_key, true);
+
+    // 2. CORS preflight + header check
+    const basePort = app.server.address().port;
+    const preflight = await fetch(`http://127.0.0.1:${basePort}/api/v1/auth/status`, {
+      method: 'OPTIONS',
+      headers: { Origin: 'https://console.example.com' },
+    });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get('access-control-allow-origin'), 'https://console.example.com');
+
+    // Create account in Default Org A
+    await app.request('/accounts', 'POST', { brand_name: 'OrgA Secret Brand', website: 'https://orga.example.com' });
+
+    // 3. Register Tenant B cleanly using separate cookie jar
+    let tenantBCookie = '';
+    const fetchB = async (path, method = 'GET', body, headers = {}) => {
+      const res = await fetch(`http://127.0.0.1:${basePort}/api/v1${path}`, {
+        method,
+        headers: {
+          ...(tenantBCookie ? { Cookie: tenantBCookie } : {}),
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
+          ...headers,
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const sc = res.headers.get('set-cookie');
+      if (sc) tenantBCookie = sc.split(';')[0];
+      return { status: res.status, body: res.status === 204 ? null : await res.json() };
+    };
+    const regB = await fetchB('/auth/organizations/register', 'POST', {
+      org_name: 'Acme Workspace B', org_slug: 'acme-b',
+      username: 'b-owner', display_name: 'Bob', email: 'bob@acme.example', password: fixturePassword,
+    });
+    assert.equal(regB.status, 201, JSON.stringify(regB.body));
+
+    // Verify strict tenant isolation
+    const bAccounts = await fetchB('/accounts');
+    assert.equal(bAccounts.body.items.length, 0);
+    await fetchB('/accounts', 'POST', { brand_name: 'OrgB Only Brand', website: 'https://orgb.example.com' });
+    assert.equal((await app.request('/accounts')).body.items.some(a => a.brand_name === 'OrgB Only Brand'), false);
+
+    // 4. TOTP MFA setup + enable + enforced on login
+    const mfaSetup = await fetchB('/auth/mfa/setup', 'POST', {});
+    assert.equal(mfaSetup.status, 200);
+    const totpCode = generateTotp(mfaSetup.body.secret);
+    const mfaEnable = await fetchB('/auth/mfa/enable', 'POST', { totp_code: totpCode });
+    assert.equal(mfaEnable.body.mfa_enabled, true);
+    await fetchB('/auth/logout', 'POST', {});
+    const loginNoOtp = await fetchB('/auth/login', 'POST', { username: 'b-owner', org_slug: 'acme-b', password: fixturePassword });
+    assert.equal(loginNoOtp.status, 401);
+    assert.equal(loginNoOtp.body.error.code, 'MFA_REQUIRED');
+    const loginWithOtp = await fetchB('/auth/login', 'POST', { username: 'b-owner', org_slug: 'acme-b', password: fixturePassword, totp_code: generateTotp(mfaSetup.body.secret) });
+    assert.equal(loginWithOtp.status, 200);
+
+    // 5. Member invitation + accept
+    const inv = await fetchB('/auth/invitations', 'POST', { username: 'b-rep', display_name: 'Rep', email: 'rep@acme.example', role: 'MEMBER' });
+    assert.equal(inv.status, 201);
+    assert.ok(inv.body.invite_token);
+    const invAcceptRes = await fetch(`http://127.0.0.1:${basePort}/api/v1/auth/invitations/accept`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: inv.body.invite_token, password: 'InvitePass123!' }),
+    });
+    assert.equal(invAcceptRes.status, 201);
+
+    // 6. Password reset request -> recorded in outbound_notifications -> confirm rotates password
+    const resetReq = await fetch(`http://127.0.0.1:${basePort}/api/v1/auth/password-reset/request`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'b-rep', org_slug: 'acme-b' }),
+    });
+    assert.equal(resetReq.status, 202);
+    const notifRow = app.db.prepare("SELECT payload FROM outbound_notifications WHERE recipient='rep@acme.example' ORDER BY created_at DESC LIMIT 1").get();
+    const resetPayload = JSON.parse(notifRow.payload);
+    assert.ok(resetPayload.reset_token);
+    const confirmRes = await fetch(`http://127.0.0.1:${basePort}/api/v1/auth/password-reset/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: resetPayload.reset_token, new_password: 'NewRepPassword123!' }),
+    });
+    assert.equal(confirmRes.status, 200);
+
+    // 7. DB-backed persistent login rate limit survives server restart
+    for (let i = 0; i < 9; i++) {
+      await fetch(`http://127.0.0.1:${basePort}/api/v1/auth/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'nobody', password: 'wrong-password-1' }),
+      });
+    }
+    await app.close();
+    app = await runApp(dbPath, { authenticate: false });
+    const blockedAfterRestart = await fetch(`http://127.0.0.1:${app.server.address().port}/api/v1/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'nobody', password: 'wrong-password-1' }),
+    });
+    assert.equal(blockedAfterRestart.status, 429);
+    assert.equal(blockedAfterRestart.body?.error?.code || (await blockedAfterRestart.json()).error.code, 'AUTH_RATE_LIMIT');
+  } finally {
+    if (prevMaster === undefined) delete process.env.KMS_MASTER_KEY; else process.env.KMS_MASTER_KEY = prevMaster;
+    if (prevCors === undefined) delete process.env.CORS_ALLOWED_ORIGINS; else process.env.CORS_ALLOWED_ORIGINS = prevCors;
+    await app.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('external worker lease execution, scheduled monitors, external connector encryption & postgres DDL', async () => {
+  const prevWorkerMode = process.env.RESEARCH_WORKER_MODE;
+  process.env.RESEARCH_WORKER_MODE = 'external';
+  let link404 = false;
+  const services = {
+    ...offlineServices,
+    fetchPage: async url => {
+      if (link404) throw new Error('HTTP 404 Not Found');
+      return { url, finalUrl: url, title: 'Live', text: 'Sample live evidence' };
+    },
+  };
+  const app = await runApp(':memory:', { services });
+  try {
+    const p = (await app.request('/workspace')).body.factory;
+    const saved = (await app.request('/factory-profile', 'PUT', { ...p, target_markets: ['US'], expected_version: p.version })).body;
+    await app.request('/factory-profile/activate', 'POST', { expected_version: saved.version, confirmed: true });
+
+    const { proof, draft } = await prepareDraft(app);
+    await approveDraft(app, draft);
+
+    // 1. External worker mode queues job instead of running inline, then runWorkerTick leases & completes it
+    const queuedRes = await app.request('/research-jobs', 'POST', { market: 'US', quantity: 5, source_mode: 'POOL' });
+    assert.equal(queuedRes.status, 202);
+    assert.equal(queuedRes.body.status, 'QUEUED');
+    const tick1 = await runWorkerTick(app.db, services, { workerId: 'worker-test-1', leaseMs: 30_000 });
+    assert.equal(tick1.processed_jobs, 1);
+    const completedJob = (await app.request(`/research-jobs/${queuedRes.body.id}`)).body;
+    assert.equal(completedJob.status, 'COMPLETED');
+
+    // 2. Scheduled monitor EVIDENCE_LINK_CHECK detects 404 -> marks EXPIRED & reconciles draft
+    link404 = true;
+    const mon = (await app.request('/monitors', 'POST', { name: 'Check dead links', kind: 'EVIDENCE_LINK_CHECK', interval_minutes: 60 })).body;
+    const monRun = (await app.request(`/monitors/${mon.id}/run`, 'POST', {})).body;
+    assert.equal(monRun.summary.expired, 1);
+    const evAfter = (await app.request('/evidence')).body.items.find(e => e.id === proof.id);
+    assert.equal(evAfter.availability_status, 'EXPIRED');
+
+    // 3. External B2B Contacts Connector encryption & query
+    const savedConn = (await app.request('/connectors/B2B_CONTACTS', 'PUT', {
+      endpoint_url: 'https://contacts.example.com/v1/lookup',
+      api_key: 'b2b-secret-token',
+      enabled: true,
+    })).body;
+    assert.equal(savedConn.enabled, true);
+    assert.equal(savedConn.has_api_key, true);
+    assert.equal(savedConn.api_key, undefined);
+    const contactsFromExt = await queryExternalContactsConnector(app.db, {
+      normalized_domain: 'example.com', brand_name: 'Example', website: 'https://example.com',
+    }, {
+      fetchImpl: async (_url, init) => {
+        assert.equal(init.headers.Authorization, 'Bearer b2b-secret-token');
+        assert.ok(init.signal);
+        return {
+          ok: true,
+          json: async () => ({
+            contacts: [
+              { full_name: 'Jane Doe', email: 'jane@example.com', role_relevance: 'PROCUREMENT', linkedin_url: 'https://www.linkedin.com/in/jane-doe' },
+              { full_name: 'John Founder', email: 'john@example.com', role_relevance: 'FOUNDER', linkedin_url: 'javascript:alert(1)', source_url: 'http://127.0.0.1/bad' },
+            ],
+          }),
+        };
+      },
+    });
+    assert.equal(contactsFromExt.length, 2);
+    assert.equal(contactsFromExt[0].email, 'jane@example.com');
+    assert.equal(contactsFromExt[0].role_relevance, 'PROCUREMENT');
+    assert.equal(contactsFromExt[1].role_relevance, 'DECISION_MAKER');
+    assert.equal(contactsFromExt[1].linkedin_url, '');
+    assert.equal(contactsFromExt[1].source_url, 'https://example.com');
+
+    // 4. Storage config & Postgres DDL verification
+    assert.equal(getStorageConfig().driver, 'sqlite');
+    const ddl = exportPostgresDdl();
+    assert.ok(ddl.includes('CREATE TABLE IF NOT EXISTS scheduled_monitors'));
+    assert.ok(ddl.includes('CREATE TABLE IF NOT EXISTS rate_limit_events'));
+  } finally {
+    if (prevWorkerMode === undefined) delete process.env.RESEARCH_WORKER_MODE; else process.env.RESEARCH_WORKER_MODE = prevWorkerMode;
+    await app.close();
+  }
+});
+
+test('inbox filters (has_contact, product_category, clear assignee), ai-runs P50/P95 & rejection_rate, DISCOVERY_MONITOR queue', async () => {
+  const prevWorkerMode = process.env.RESEARCH_WORKER_MODE;
+  process.env.RESEARCH_WORKER_MODE = 'external';
+  const app = await runApp(':memory:');
+  try {
+    const p = (await app.request('/workspace')).body.factory;
+    const saved = (await app.request('/factory-profile', 'PUT', { ...p, target_markets: ['US'], expected_version: p.version })).body;
+    await app.request('/factory-profile/activate', 'POST', { expected_version: saved.version, confirmed: true });
+
+    const { item: oppWithContact } = await prepareDraft(app);
+    const b2 = (await app.request('/accounts', 'POST', { brand_name: 'NoContact Co', website: 'https://nocontact.example.com' })).body;
+    const oppNoContact = (await app.request('/opportunities', 'POST', { account_id: b2.id, product_category: 'LAUNDRY_PODS', reason: 'Inbox filter check' })).body;
+
+    const usableList = (await app.request('/opportunities?has_contact=USABLE&product_category=LAUNDRY_PODS')).body.items;
+    assert.ok(usableList.some(o => o.id === oppWithContact.id));
+    assert.ok(!usableList.some(o => o.id === oppNoContact.id));
+    const noneList = (await app.request('/opportunities?has_contact=NONE')).body.items;
+    assert.ok(noneList.some(o => o.id === oppNoContact.id));
+    assert.ok(!noneList.some(o => o.id === oppWithContact.id));
+
+    // Clear assignee works with null and keeps by_assignee unassigned key empty ('')
+    const curOpp = (await app.request(`/opportunities/${oppWithContact.id}`)).body;
+    const cleared = await app.request(`/opportunities/${oppWithContact.id}/assign`, 'PATCH', { expected_version: curOpp.version, assigned_to: null });
+    assert.equal(cleared.status, 200);
+    assert.equal(cleared.body.assigned_to, '');
+    const funnelAfterClear = (await app.request('/analytics/funnel')).body;
+    assert.equal(funnelAfterClear.filters.market, 'ALL');
+    assert.ok(funnelAfterClear.breakdowns.by_assignee.some(row => row.assigned_to === ''));
+    const funnelEu = (await app.request('/analytics/funnel?market=EU')).body;
+    assert.equal(funnelEu.filters.market, 'EU');
+    assert.equal(funnelEu.metrics.candidates, 0);
+
+    // ai-runs P50/P95 & validation rejection rate (including MODEL_ANALYSIS_VALIDATION_FAILED)
+    const now = new Date().toISOString();
+    app.db.prepare('INSERT INTO ai_runs (id,organization_id,purpose,model,prompt_version,input_tokens,output_tokens,cost_usd,duration_ms,status,error_code,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(randomUUID(), 'local-lancco', 'DRAFT_GENERATION', 'claude-test', 'v1', 100, 40, 0.001, 120, 'SUCCEEDED', '', now);
+    app.db.prepare('INSERT INTO ai_runs (id,organization_id,purpose,model,prompt_version,input_tokens,output_tokens,cost_usd,duration_ms,status,error_code,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(randomUUID(), 'local-lancco', 'DRAFT_GENERATION', 'claude-test', 'v1', 110, 45, 0.0012, 340, 'FAILED', 'MODEL_CLAIM_VALIDATION_FAILED', now);
+    app.db.prepare('INSERT INTO ai_runs (id,organization_id,purpose,model,prompt_version,input_tokens,output_tokens,cost_usd,duration_ms,status,error_code,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(randomUUID(), 'local-lancco', 'ACCOUNT_ANALYSIS', 'claude-test', 'v1', 90, 30, 0.0009, 200, 'FAILED', 'MODEL_ANALYSIS_VALIDATION_FAILED', now);
+    const aiRuns = (await app.request('/ai-runs')).body;
+    assert.equal(aiRuns.summary.total_runs, 3);
+    assert.equal(aiRuns.summary.validation_rejected, 2);
+    assert.equal(aiRuns.summary.rejection_rate, 0.6667);
+    assert.equal(aiRuns.summary.p50_duration_ms, 200);
+    assert.equal(aiRuns.summary.p95_duration_ms, 200);
+    assert.equal(aiRuns.summary.by_model_prompt[0].model, 'claude-test');
+
+    // Storage config activates live postgres when both DB_DRIVER=postgres and valid DATABASE_URL are set
+    const pgStorage = getStorageConfig({ DB_DRIVER: 'postgres', DATABASE_URL: 'postgres://user:pass@localhost:5432/botein' });
+    assert.equal(pgStorage.driver, 'postgres');
+    assert.equal(pgStorage.active_runtime, 'postgres');
+    assert.equal(pgStorage.configured_driver, 'postgres');
+    assert.equal(pgStorage.postgres_configured, true);
+
+    const pgFallback = getStorageConfig({ DB_DRIVER: 'postgres' });
+    assert.equal(pgFallback.driver, 'sqlite');
+    assert.equal(pgFallback.active_runtime, 'sqlite');
+    assert.equal(pgFallback.configured_driver, 'postgres');
+    assert.equal(pgFallback.postgres_configured, false);
+
+    // DISCOVERY_MONITOR creates QUEUED DISCOVERY research job when idle & factory is active
+    const mon = (await app.request('/monitors', 'POST', { name: 'Daily US Discovery', kind: 'DISCOVERY_MONITOR', interval_minutes: 1440 })).body;
+    const monRun = (await app.request(`/monitors/${mon.id}/run`, 'POST', {})).body;
+    assert.ok(monRun.summary.queued_job_id, `expected queued_job_id, got ${JSON.stringify(monRun.summary)}`);
+    const queuedJob = (await app.request(`/research-jobs/${monRun.summary.queued_job_id}`)).body;
+    assert.equal(queuedJob.status, 'QUEUED');
+    assert.equal(queuedJob.source_mode, 'DISCOVERY');
+  } finally {
+    if (prevWorkerMode === undefined) delete process.env.RESEARCH_WORKER_MODE; else process.env.RESEARCH_WORKER_MODE = prevWorkerMode;
+    await app.close();
+  }
+});
+
+test('postgres store translation and sql dump backup verification', async () => {
+  assert.equal(
+    rewritePlaceholders("SELECT * FROM accounts WHERE organization_id=? AND brand_name='Why?''no?' AND domain=?"),
+    "SELECT * FROM accounts WHERE organization_id=$1 AND brand_name='Why?''no?' AND domain=$2",
+  );
+  assert.deepEqual(translateSqliteToPostgres('PRAGMA integrity_check'), { syntheticRow: { integrity_check: 'ok' } });
+  assert.deepEqual(translateSqliteToPostgres('PRAGMA journal_mode = WAL'), { skip: true });
+  assert.deepEqual(translateSqliteToPostgres('VACUUM'), { skip: true });
+  assert.deepEqual(translateSqliteToPostgres('BEGIN IMMEDIATE'), { sql: 'BEGIN' });
+  assert.equal(
+    translateSqliteToPostgres('INSERT OR IGNORE INTO organizations (id, name, slug, created_at) VALUES (?,?,?,?)').sql,
+    'INSERT INTO organizations (id, name, slug, created_at) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING',
+  );
+  assert.equal(
+    translateSqliteToPostgres("SELECT name FROM sqlite_master WHERE type='table'").sql,
+    "SELECT tablename AS name FROM pg_tables WHERE schemaname='public'",
+  );
+
+  const dir = await mkdtemp(join(tmpdir(), 'botein-pg-dump-'));
+  try {
+    const validDump = join(dir, 'backup.sql');
+    await writeFile(validDump, '-- PostgreSQL database dump\nSET statement_timeout = 0;\nCREATE TABLE organizations (id text);\n-- PostgreSQL database dump complete\n');
+    const okResult = verifyBackup(validDump);
+    assert.equal(okResult.engine, 'postgres');
+    assert.equal(okResult.integrity, 'ok');
+
+    const incompleteDump = join(dir, 'partial.sql');
+    await writeFile(incompleteDump, '-- PostgreSQL database dump\nCREATE TABLE organizations (id text);\n');
+    const badResult = verifyBackup(incompleteDump);
+    assert.equal(badResult.engine, 'postgres');
+    assert.equal(badResult.integrity, 'incomplete');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('opportunities and follow-up tasks default clean assignees without LOCAL_OWNER leak and validate member assignments', async () => {
+  const app = await runApp(':memory:');
+  try {
+    const account = (await app.request('/accounts', 'POST', { brand_name: 'Clean Assign Brand', website: 'https://clean-assign.example.com' })).body;
+    const badOpp = await app.request('/opportunities', 'POST', { account_id: account.id, reason: 'Bad assignee check', assigned_to: 'nobody' });
+    assert.equal(badOpp.status, 422);
+
+    const opp = (await app.request('/opportunities', 'POST', { account_id: account.id, reason: 'Clean assignee check' })).body;
+    assert.equal(opp.assigned_to, '');
+
+    const defaultTaskRes = await app.request('/follow-up-tasks', 'POST', {
+      opportunity_id: opp.id,
+      title: 'Initial intro review',
+      due_at: new Date(Date.now() + 86400_000).toISOString(),
+      idempotency_key: randomUUID(),
+    });
+    assert.equal(defaultTaskRes.status, 201, JSON.stringify(defaultTaskRes.body));
+    assert.equal(defaultTaskRes.body.assigned_to, 'test-owner');
+
+    const unassignedTaskRes = await app.request('/follow-up-tasks', 'POST', {
+      opportunity_id: opp.id,
+      title: 'Unassigned backlog check',
+      due_at: new Date(Date.now() + 86400_000).toISOString(),
+      assigned_to: '',
+      idempotency_key: randomUUID(),
+    });
+    assert.equal(unassignedTaskRes.status, 201);
+    assert.equal(unassignedTaskRes.body.assigned_to, '');
+
+    const memberRes = await app.request('/auth/members', 'POST', {
+      username: 'follow-rep',
+      display_name: 'Follow Rep',
+      password: 'member-pass-12345',
+      role: 'MEMBER',
+    });
+    assert.equal(memberRes.status, 201);
+    const memberId = memberRes.body.id;
+
+    const reassigned = await app.request(`/follow-up-tasks/${defaultTaskRes.body.id}`, 'PATCH', {
+      expected_version: 1,
+      assigned_to: 'follow-rep',
+    });
+    assert.equal(reassigned.status, 200);
+    assert.equal(reassigned.body.assigned_to, 'follow-rep');
+
+    await app.request(`/auth/members/${memberId}`, 'PATCH', { status: 'DISABLED', expected_version: memberRes.body.version });
+    const badReassign = await app.request(`/follow-up-tasks/${defaultTaskRes.body.id}`, 'PATCH', {
+      expected_version: 2,
+      assigned_to: 'follow-rep',
+    });
+    assert.equal(badReassign.status, 422);
+  } finally {
+    await app.close();
+  }
 });

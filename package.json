@@ -8,9 +8,11 @@
     "predev": "node scripts/ensure-env.mjs",
     "dev": "node --watch --env-file-if-exists=.env src/server.mjs",
     "start": "node --env-file-if-exists=.env src/server.mjs",
+    "worker": "node --env-file-if-exists=.env scripts/worker.mjs",
+    "pg-migrate": "node --env-file-if-exists=.env scripts/pg-migrate.mjs",
     "test": "node --test src/server.test.mjs",
-    "backup": "node scripts/backup.mjs",
-    "verify-backup": "node scripts/verify-backup.mjs",
-    "check": "node --check src/auth.mjs && node --check src/contacts.mjs && node --check src/accounts.mjs && node --check src/evidence.mjs && node --check src/data-transfer.mjs && node --check src/server.mjs && node --check src/products.mjs && node --check src/drafts.mjs && node --check src/tracking.mjs && node --check src/research.mjs && node --check src/sales.mjs && node --check src/store.mjs && node --check src/validation.mjs && node --check src/source-fetch.mjs && node --check src/sources.mjs && node --check src/audit.mjs && node --check src/pagination.mjs && node --check src/paths.mjs && node --check src/search.mjs && node --check src/model.mjs && node --check src/discovery.mjs && node --check src/maintenance.mjs && node --check scripts/backup.mjs && node --check scripts/verify-backup.mjs && node --check scripts/ensure-env.mjs && node --check public/app.js && node --check public/drafts.js && node --check public/products.js && node --check public/data-transfer.js && node --check public/accounts.js && node --check public/contacts.js && node --check public/auth.js"
+    "backup": "node --env-file-if-exists=.env scripts/backup.mjs",
+    "verify-backup": "node --env-file-if-exists=.env scripts/verify-backup.mjs",
+    "check": "for f in src/*.mjs public/*.js scripts/*.mjs; do node --check \"$f\" || exit 1; done"
   }
 }

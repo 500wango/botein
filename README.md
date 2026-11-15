@@ -2,86 +2,54 @@
 
 > 产品正式名称：**Botein**。本版由 SignalSniper 更名而来。
 
-LANCCO 海外品牌开发工作台。当前交付是 **本地基础版本**，产品规格见 [agent_prd.md](agent_prd.md)。
+LANCCO / 多租户海外品牌智能开发工作台，产品规格见 [agent_prd.md](agent_prd.md)。支持本地 SQLite（`node:sqlite`）与 PostgreSQL 实时运行时（零第三方驱动依赖的纯 JS PG v3 协议客户端）双模式运行。
 
 ## 启动
 
-需要 Node.js 22.13+（已在 22.23.2 验证），使用 Node 内置 HTTP、SQLite 和测试工具，无第三方 JavaScript 依赖、无构建步骤。
+需要 Node.js 22.13+（已在 22.23.2 验证），无第三方 JavaScript 运行时依赖、无前端构建步骤。
 
 ```bash
 npm start
 ```
 
-打开 **http://127.0.0.1:3187**。首次由你创建本地负责人账号和密码，现有业务资料保留；之后登录进入。修改代码时使用 `npm run dev`；若 `.env` 不存在，会先从 `.env.example` 生成本地配置（`.env` 已被 Git 忽略）。
+默认监听 **http://127.0.0.1:3187**（可通过 `HOST` / `PORT` / `.env` 配置）。首次设置可创建负责人账号，或开放多组织注册、成员邀请加入。修改代码时使用 `npm run dev`；若 `.env` 不存在，会先从 `.env.example` 生成本地配置（`.env` 已被 Git 忽略）。
 
-自动发现还需要本地搜索与模型：先运行 `docker compose up -d` 启动 SearXNG，并配置模型网关环境变量；详见“模型与搜索接入”。
+自动发现需要本地搜索与模型：先运行 `docker compose up -d` 启动 SearXNG，并配置模型网关环境变量；详见“模型与搜索接入”。如需独立后台队列与定时监控进程，可运行 `npm run worker`。
 
-默认数据库位于 `data/botein.sqlite`，首次启动创建表并预填 LANCCO 工厂草稿；不会生成演示品牌、商机或任务。关闭进程后数据保留。如果新路径不存在但旧版 `data/signalsniper.sqlite` 存在，启动时会继续使用旧库并输出提示；迁移时请停服后整体移动数据库及同目录 `-wal`/`-shm` 文件，或设置 `DATABASE_PATH`。
-
-如需更换端口或数据库，将 `.env.example` 复制为 `.env` 并修改其中配置，或使用：
+默认 SQLite 数据库位于 `data/botein.sqlite`，启动时会自动完成 schema 迁移（当前 schema 版本 v17）。如需使用 PostgreSQL 实时运行时：
 
 ```bash
-PORT=3188 DATABASE_PATH=./data/another-workspace.sqlite npm start
+DB_DRIVER=postgres DATABASE_URL=postgres://user:pass@localhost:5432/botein npm start
+# 从现有 SQLite 全量迁移到 PostgreSQL：
+DB_DRIVER=postgres DATABASE_URL=postgres://user:pass@localhost:5432/botein npm run pg-migrate -- --from-sqlite ./data/botein.sqlite
 ```
 
-Node 22 的 `node:sqlite` 可能输出 ExperimentalWarning，不影响本地运行。启动时会在事务中补齐本轮证据版本/核验字段、商机、联系人、销售、研究任务、来源登记、原文清除、研究建议及研究执行详情字段，使用 SQLite `user_version` 标识升级（当前为 15），不清空旧数据。升级前建议使用 SQLite backup 保存快照（运行中的数据库不要只复制主文件，WAL 可能尚未合并）。
+## 多租户认证、RBAC 与安全部署
 
-## 本地负责人登录
+会话 Cookie 使用 `botein_session`：
 
-更名后会话 Cookie 使用 `botein_session`；旧版 Cookie 不再有效，需要重新登录一次，业务数据不受影响。
+- 支持本地负责人首次初始化（`POST /api/v1/auth/setup`）、多工作区注册（`POST /api/v1/auth/organizations/register`，受 `ALLOW_MULTI_ORG_REGISTER` 控制）、工作区成员邀请（`OWNER` / `MEMBER` RBAC 隔离）、成员启用/停用、密码重置令牌流程以及双因素认证（TOTP MFA）。
+- 密码使用 Node scrypt（N=32768，r=8，p=1）和随机盐；Cookie 为随机 32 字节值，数据库只保存 SHA-256 会话摘要。Cookie 使用 `HttpOnly`、`SameSite=Strict`、`Path=/`，在 HTTPS 或反向代理（`TRUST_PROXY=1` + `X-Forwarded-Proto: https`）下自动附加 `Secure`。
+- 支持按环境变量配置 `HOST` / `PORT`、`PUBLIC_BASE_URL` / `TRUSTED_HOSTS`、`CORS_ALLOWED_ORIGINS`、持久化限流表（`rate_limit_events`）与信封加密（`KMS_MASTER_KEY` / `CONNECTOR_ENCRYPTION_KEY`）。
+- 支持有效会话管理（`GET /api/v1/auth/sessions`、`POST /revoke`、`POST /revoke-others`）及独立凭据版本号撤销。
 
-- 首次打开时创建唯一负责人账号；账号为去除首尾空白后的 1–64 个字符，支持中文、内部空格和常用符号；英文大小写不敏感，密码至少 8 个字符、最多 256 个 UTF-8 字节。密码不裁剪空白，支持密码管理器和粘贴。没有预置密码，不代用户创建真实账号。
-- 负责人账号与当前固定工作空间绑定，不增加成员、注册第二个组织或开放公网注册。首次设置只在账号不存在时生效，重复或并发设置被拒绝；未设置前业务 API 也不开放读取。
-- 密码使用 Node scrypt（N=32768，r=8，p=1）和随机盐；Cookie 为随机 32 字节值，数据库只保存 SHA-256 会话摘要。Cookie 使用 HttpOnly、SameSite=Strict、Path=/，12 小时固定有效期；本地 HTTP 下不标 Secure。本版仍只监听 loopback，不能据此当作公网 HTTPS 部署方案。
-- GET `/api/v1/auth/status` 公开返回初始化/登录状态，匿名不返回账号信息。POST `/auth/setup`、`/auth/login`、`/auth/logout`、`/auth/password` 管理本地会话；其余 `/api/` 路径包括下载都必须登录。Host/Origin 和 JSON 请求限制继续生效。
-- 退出立即删除当前服务端会话；修改密码必须提交当前密码，更新后撤销全部旧会话并只为当前窗口签发新会话。API 会话过期、窗口重新获得焦点发现撤销、浏览器历史恢复时，页面清除/重新加载业务视图；未保存输入会丢弃。
-- 账号相关计算入口限制为每服务进程 15 分钟内最多 10 次尝试、同时最多 2 次密码运算，包括成功尝试；重启清空此限流窗口，不属于分布式限流。账号表、会话表和数据库备份需要本机文件权限保护。
-- 接入状态 → 查看有效登录：只列出当前负责人尚未过期的会话，展示创建/到期时间及独立随机标识，标出当前会话；不返回 Cookie 值/摘要，也不推断设备、位置或在线状态。相同浏览器标签可能共用会话。
-- `GET /api/v1/auth/sessions` 读取列表；`POST /api/v1/auth/sessions/{id}/revoke` 撤销指定会话，`POST /api/v1/auth/sessions/revoke-others` 退出其他会话，两者需 `confirmed:true`。当前会话可撤销并清除 Cookie；未知、过期或其他负责人会话统一 404。
-- 撤销立即影响后续服务端请求，不撤回已经返回的页面内容；其他窗口在请求、焦点/可见性恢复检查时回到登录。批量退出不阻止随后使用有效密码重新登录，怀疑密码泄露时应修改密码。列表标识不用于登录，旧会话升级仅补独立标识，不改到期时间或撤销它们。
-- 账号界面在接入状态页；审计仍标记固定 `LOCAL_OWNER`，当前只有一个负责人，不是完整的 Owner/Member 权限系统。密码、Cookie 值不会进入业务审计或前端 localStorage。
-- 当前没有邮件验证、密码找回或无密码重置接口。请保管密码；遗忘时不要删除整个业务数据库，应先停服/备份，再由本机维护者执行受控恢复。测试只创建临时账号，不修改默认库的负责人状态。
+## 已实现核心能力
 
-## 已实现
+- **账号与团队权限**：多工作区隔离、`OWNER` / `MEMBER` 权限隔离、成员邀请、TOTP 双因素认证与受控密码找回/重置。
+- **工厂多规格档案**：支持多包装/配方阶梯生产条款（`production_terms`）、合规资质认证管理（`certifications` 及有效期检查）、禁用市场（`prohibited_markets`）、版本乐观锁与逐字段核验记录。
+- **规则化硬约束匹配（Fit Engine）**：逐项检查品类、市场、起订量/单位/包装及认证匹配情况（`PASS / CONFLICT / UNKNOWN`），输出可解释匹配明细。
+- **品牌池与产品 SKU**：手工录入、编辑、名称/域名搜索、同域名身份冲突待核对流程、多维 SKU 管理与变更历史。
+- **证据与来源治理**：记录 `source_id`、`source_kind`、`availability_status`（可达性监测）与观察时间；支持安全解压（gzip/deflate/br）、多 IP 回退与可选 Headless Chrome DOM 渲染（`HEADLESS_RENDER=1`）；支持保留政策清除原文。
+- **端到端研究工作流（Discovery & Pool）**：`DISCOVERY` 自动串联查询搜索、落地页聚合、SKU 识别、信号分析、规则预匹配、官网联系人发现与引用级草稿生成；支持 `embedded` / `external`（`npm run worker`）双执行模式、预算控制、租户并发锁、崩溃恢复与增量监控调度（`scheduled_monitors`）。
+- **外部连接器与可观测性**：加密存储外接 B2B 联系人 / 电商 / 通知（邮件/Webhook）连接器配置（`connector_configs`）；落地 `ai_runs` 遥测看板统计 P50/P95 延迟、Token 用量、估算成本与引用校验拒绝率。
+- **可配置市场与品类**：通过 `SUPPORTED_PRODUCT_CATEGORIES` 与 `SUPPORTED_MARKETS` 支持多品类与多区域扩展（详阅 [.env.example](.env.example)）。
+- **销售执行、漏斗与工作台**：可追溯 Claim 划词引用草稿与跟进序列模板（`FIRST_TOUCH` / `SAMPLE_FOLLOWUP` / `MOQ_QUOTE`）、机会详情上/下一条快速审阅、受控禁联解除、UTF-8 表格安全导入导出，以及基于 SQLite 或 PostgreSQL 的双引擎持久化与备份校验。
 
-- 账号：一次性本地负责人初始化、登录、退出、修改密码、会话过期/撤销和业务 API 访问控制。
-- 工厂档案：官网资料预填、保存草稿、版本冲突检查、负责人确认后启用、已启用版本历史。
-- 品牌池：手工录入、编辑及变更历史、名称/域名筛选、CSV 导入。重复品牌复用，同域名不同品牌保存至身份核对列表，支持明确新增独立品牌、复用已有或排除候选。
-- 品牌产品与 SKU：在品牌池或商机详情中录入产品、原始链接、平台 SKU、包装及备注，支持编辑/归档和变更历史；产品资料录入不等于确认在售。
-- 证据：关联品牌，可选关联该品牌下的具体产品，保存原文、来源、发布时间与观察时间；相同证据去重，初始为 `UNVERIFIED`。可显式读取公开页面文本用于人工核对，读取不等于核验；可人工核验或填写原因标记失效，保留版本与审计，不改写原文。可按保留政策清除原文，保留来源与审计元数据。可调用模型做信号分析，结果只作人工参考。
-- 商机：从已知品牌手工加入，品牌/品类唯一复用；审核、待补证据、合格、不合格、归档和重开，所有状态变更有版本检查与历史。
-- 合格审核：引用本品牌已核验的品类、美国在售、开发理由证据，核对启用的工厂档案，明确确认无已知硬冲突；订单条件未知保留为 `NEEDS_REVIEW`，不声称采购量或 MOQ 匹配。美国在售证据超过 7 天需重新核验。
-- 联系人：在商机内录入、编辑姓名/职能/公开来源并查看变更历史，人工核验、标记失效或禁止联系；组织内同一规范化邮箱共用抑制记录，重复录入或改名不恢复。接入状态页可集中搜索联系人、查看组织级禁止联系列表。
-- 销售活动：人工确认外部发送后记录邮件、回复、会议、样品、报价、成交和丢单；支持幂等重放、历史补录和误录作废。未知成交金额留空，已记录的样品阶段不会被更早的邮件补录回退。
-- 研究任务：`DISCOVERY` 使用本地 SearXNG 与模型筛选公开网页候选，搜索或模型不可用时明确返回 503，不创建空转任务；`POOL` 模式按确定性规则整理品牌池，创建待审核商机，并保存分档原因、缺失资料、预算和任务快照。不自动合格、不生成草稿。
-- 研究来源登记：记录来源类型、允许域名、市场/品类、限速、使用授权与保留方式；启用需显式确认，核心字段变化会退回待启用。来源登记用于受治理页面读取；自动发现由本地搜索与模型配置执行。
-- 跟进待办：关联商机，保存事项、备注、截止时间；编辑、完成、取消、重开有版本检查与审计。首页显示最早到期的三个待处理事项，集中页面支持逾期/今天/完成等筛选；不发提醒，不自动生成销售活动。
-- 销售漏斗：按商机创建日期选择同一候选队列，再按观察截止时间统计各阶段去重商机数；首次审核与当前状态分开，空分母显示 N/A，补录和作废活动可重算历史结果。
-- 英文草稿：支持人工撰写与模型生成候选草稿；主题、正文、目标联系人、逐条事实与原文/工厂字段引用；编辑追加新版本，旧内容、审批和发送关联保留。模型生成后仍需逐条核对并人工审批，不冒充已批准内容。
-- 草稿审批与复制：本地负责人核对全文和引用后批准，绑定证据、联系人、资格审核和工厂版本；复制主题/正文前服务端再次校验，复制不新增销售活动。
-- 工厂字段核验：支持产品、服务类型、MOQ、单位、包装条件、交期逐项核验，保留依据与具体档案版本；启用档案不代替逐项核验。
-- 证据 CSV 导入：UTF-8、最多 500 行，支持多行原文和逐行错误反馈；复用手工录入规则，观察时间来自输入，导入不升级核验状态。
-- 业务 CSV 导出：在接入状态页下载当前工作空间全部品牌、产品、证据或商机，保留状态与关联 ID，处理公式型内容并记录导出请求审计。
-- 备份与审计：一致性快照、完整性校验与表计数；接入状态页可按游标分页查看审计元数据，不展示凭据或页面正文。
-- 业务列表分页：品牌、证据、商机、联系人、待办、研究任务、来源等列表使用稳定复合游标，默认每页 20、最大 100；品牌池支持服务端搜索与“加载更多”，证据列表支持“加载更多”。
-- SQLite 持久化，关键写入与审计记录在事务中完成。
-- 中文响应式界面、系统深浅色、键盘操作和原生对话框。
+## 使用边界说明
 
-工厂档案启用只确认产品、服务及市场承接能力；不会自动核验官网的认证、性能或产能。保存修改后回到草稿，本轮保守地将已有合格商机转为待重评，重新确认档案并审核后才恢复资格；历史版本和销售记录保留。
-
-人工核验表示操作者核对过来源和对应关系，不保证作者描述或采购意向为真。证据被证伪后，引用它的合格商机立即转为 `REASSESSMENT_REQUIRED`。不使用模型判定语义，也不创建 AI 草稿；可以人工撰写、标注事实并审批。
-
-历史发送和回复可如实补录，不以当前资格或联系人状态抹除真实历史；禁止联系的邮箱仍可作为历史活动对象，系统给出警告且不恢复可联系状态。所有活动标为 `USER_REPORTED`，没有实际发送操作。作废误录只保留审计并重算阶段，属于本地负责人的更正操作。
-
-## 当前边界
-
-这是**固定本地工作空间、单人开发模式**，不是已上线的多租户 SaaS。服务固定监听 `127.0.0.1` 并检查 Host/Origin；已加入本地负责人登录；尚无成员授权、完整租户隔离、分页和生产部署配置，不要直接公开部署。
-
-后续仍需实现联系人自动发现与多租户/成员权限。当前自动发现基于本地 SearXNG 与模型筛选候选，不承诺全网或实时覆盖，也不读取登录后内容、付费墙或需绕过访问控制的内容。当前只在商机详情管理联系人、人工草稿和活动，没有独立主导航的联系人/活动页；联系人目录通过接入状态页打开。不要把密钥放进客户端代码或提交进 Git。
-
-来源 URL 默认只保存与展示；只有用户显式点击“读取公开页面”时才由服务端读取一次。读取路径已实现 DNS 校验、地址固定、逐跳重定向校验、超时/大小/类型限制，但仍不是通用爬虫：读取路径自身不执行自动发现，自动发现由研究任务调用本地 SearXNG；不绕过登录、付费墙或访问控制。
-
-CSV 为当前最多 500 行的同步导入，返回每行结果；同域名身份冲突保留到品牌池的人工核对列表，未处理前不创建品牌。当前不提供异步导入任务。品牌样例：
+- `DISCOVERY` 自动发现仅面向公开网页与登记合规来源，不读取登录后页面、付费墙或绕过访问控制。
+- AI 分析、联系人发现与 AI 草稿生成仅作辅助候选；合规发送仍保持**人工核对事实引用、人工最终批准及人工确认外部活动记录**的核心防幻觉边界。
+- 品牌 CSV 导入最多支持单文件 500 条记录与同域名待复核隔离：
 
 ```csv
 brand_name,website,headquarters_country,notes
@@ -141,6 +109,14 @@ CSV 每个字段加引号并转义内部引号，公式前缀（含前导空白/
 - 每次复制必须提交当前草稿修订号和具体版本 ID；服务端重验后返回该版本主题/正文。浏览器复制权限被拒绝时显示错误，不记录发送；复制请求审计只说明内容请求，不证明剪贴板写入或外部投递。
 - 记录外部实际发送时可选择当时的草稿版本（含已被替代/失效版本），须属于同商机及联系人。历史发送与内容不因以后失效而删除。旧页面、普通详情和版本历史仍可阅读原文，系统不承诺阻止用户手工选择文本或撤回外部已复制内容。
 
+## 联系人自动发现
+
+- `POST /api/v1/accounts/{id}/contacts/discover` 由用户显式触发，需要模型与本地搜索可用。
+- 只用 4 条 `site:{品牌域名}` 查询搜索品牌官网公开页面，最多读取 5 个同域名页面；模型只收到这些页面的文本和 URL。
+- 模型返回的邮箱必须满足：格式有效、来源 URL 属于已读取页面、邮箱出现在该页面文本或同页公开 `mailto:` 链接中。姓名/职能只有在页面文本中出现时才保留，否则使用通用称呼或留空。
+- 成功联系人始终保存为 `UNVERIFIED`，保留公开来源 URL，不自动核验、不自动禁止联系、不发送任何消息。已存在邮箱复用原记录，不恢复抑制状态。
+- 未找到邮箱时返回空列表并如实说明；搜索/模型不可用返回 503。审计记录查询次数、页面数、新增/复用/失败数和模型用量，不记录页面正文。
+
 ## AI 证据分析
 
 - `POST /api/v1/evidence/{id}/analyze` 只在模型已配置且证据未清除、未失效时执行；结果写入 `signal_assessments`，绑定分析时的证据版本。
@@ -171,41 +147,38 @@ CSV 每个字段加引号并转义内部引号，公式前缀（含前导空白/
 ## 模型与搜索接入
 
 - 免费搜索：`docker compose up -d` 启动本地 SearXNG（`127.0.0.1:8888`，JSON 输出，仅监听本机）。可用 `SEARCH_BASE_URL` 覆盖地址。`search/settings.yml` 中的 `secret_key` 仅用于本地开发实例，不要公开该端口。
-- 模型：使用 Anthropic 兼容消息接口。优先读取 `MODEL_BASE_URL` / `MODEL_API_KEY` / `MODEL_NAME`，否则回退 `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`（或 `ANTHROPIC_AUTH_TOKEN`）/ `ANTHROPIC_DEFAULT_SONNET_MODEL`。密钥只从环境读取，不写入代码、日志或数据库。模型用于候选筛选、英文草稿生成和证据信号分析，不用于自动合格或自动发送。
+- 模型：使用 Anthropic 兼容消息接口。优先读取 `MODEL_BASE_URL` / `MODEL_API_KEY` / `MODEL_NAME`，否则回退 `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`（或 `ANTHROPIC_AUTH_TOKEN`）/ `ANTHROPIC_DEFAULT_SONNET_MODEL`。密钥只从环境读取，不写入代码、日志或数据库。模型用于候选筛选、英文草稿生成、证据信号分析和公开联系人提取，不用于自动合格、自动核验联系人或自动发送。
 - `GET /workspace` 的 `integrations` 动态显示连接状态；模型未配置或 SearXNG 不可达时，`DISCOVERY` 返回 503，不创建任务。
-- 发现流程：4 条公开搜索查询 → 最多 12 个候选域名（排除已知零售商、媒体、社交平台和目录）→ 每页最多 2 MB 的受控读取 → 模型按严格 JSON 筛选品牌与洗衣凝珠信号。系统只创建 `UNVERIFIED` 证据和 `NEEDS_INFORMATION` 研究结果；不自动创建商机、不自动合格、不生成草稿。
+- 发现流程：依据市场、产品品类与客户类型动态构建查询池 → 按预算（默认最多 50 次搜索、200 次页面读取、30 分钟、5 USD）筛选落地页并聚合抓取产品页/市场证据 → 提取产品 SKU 与 AI 信号分析 → 执行规则化工厂硬约束预匹配（`fit_checks`）→ 官网发现联系人 → 满足条件时自动生成待审英文 `DRAFT` 草稿。系统仍严格保持**人工核验与人工审批不可跳过**。
 - 发现筛选只发送搜索标题/摘要、页面标题/描述/摘录；草稿生成只发送品牌、联系人姓名/职能、已核验证据和工厂字段，不发送联系人邮箱。搜索摘要和页面原文都作为不可信数据处理。`DEBUG_DISCOVERY=1` 可把模型原始候选输出到服务端日志，仅用于本地诊断。
 
 ## 研究任务与品牌池分档
 
-- `POST /api/v1/research-jobs` 接受 `market`（首版仅 `US`）、可选 `product_categories`（仅 `LAUNDRY_PODS`）、`account_types`、`quantity`（1–50，默认 20）、`min_evidence_quality`（`MEDIUM`/`HIGH`，默认 `MEDIUM`）、`contact_preferences`、`language`（仅 `en`）和 `source_mode`。不支持的区间返回 422，不静默截断。
+- `POST /api/v1/research-jobs` 接受 `market`（来自 `SUPPORTED_MARKETS` 配置）、可选 `product_categories`（来自 `SUPPORTED_PRODUCT_CATEGORIES` 配置）、`account_types`、`quantity`（1–50，默认 20）、`min_evidence_quality`（`MEDIUM`/`HIGH`，默认 `MEDIUM`）、`contact_preferences`、`language`（仅 `en`）和 `source_mode`。不支持的区间返回 422，不静默截断。
 - `source_mode=DISCOVERY` 是默认值，使用本地 SearXNG 搜索与模型筛选候选；搜索不可达或模型未配置时返回 `503 SEARCH_UNAVAILABLE` / `MODEL_NOT_CONNECTED`，不创建任务、不产生费用，也不静默降级为品牌池。`POOL` 是显式选择的兜底模式，只分析本工作空间已保存的品牌、产品、证据和人工审核记录。
-- 创建成功后返回 `202` 与 `QUEUED`；任务在后台执行，页面每 2 秒轮询状态并显示当前步骤。支持取消排队/执行中的任务，已结束任务取消幂等返回原终态。`POOL` 在事务中快速完成，`DISCOVERY` 在搜索/页面读取/模型调用之间检查取消；取消后不再写入新结果。
-- 执行故障会把任务标记为 `FAILED`，保留原因、计数和预算。任务保存输入快照、工厂版本、attempt、停止原因、执行详情和累计预算；当前限额为每任务 50 次搜索、200 次页面请求、30 分钟和 5 USD，品牌池模式不调用外部服务，实际用量为 0。页面同时为部分完成/失败任务提供重试。
-- 分档是确定性规则，不使用模型：已有产品明确属于其他已知品类时为 `NOT_FIT`（列入排除记录，不计入返回数量）；缺少品类、已人工确认的美国在售证据或达到门槛的已核验证据时为 `NEEDS_INFORMATION`；三者齐备时为 `PRIORITY_REVIEW`。
-- 证据质量当前最高只能判为 `MEDIUM`：人工核验只证明出处、原文和归属，系统尚未记录第一方来源属性。因此 `min_evidence_quality=HIGH` 会把候选放入待补资料，而不是假装达标。
-- 研究只为已确认洗衣凝珠品类的品牌创建 `NEW` 商机；已有商机复用，不覆盖资格、销售阶段、负责人或历史。研究从不自动 `QUALIFIED`；联系人缺失记为 `CONTACT_NOT_FOUND`；模型未接入时结果标为 `MODEL_NOT_CONNECTED`，不生成草稿。
-- 每条结果保存确定性的 `next_actions`：优先审核建议确认采购条件与联系人渠道；待补资料按缺口列出补产品、补美国在售证据、补开发理由或改用可判定的证据门槛；不匹配只保留排除说明。页面同时为部分完成/失败任务提供重试，为排队/执行中任务提供取消。
-- `GET /api/v1/research-jobs` 列出任务；`GET /api/v1/research-jobs/{id}`、`/results`、`/failures` 查看任务、结果快照和失败项。`POST /{id}/cancel` 对已结束任务幂等返回原终态；`POST /{id}/retry` 仅接受 `PARTIAL`/`FAILED`，增加 attempt 并保留人工审核结果。创建支持 `Idempotency-Key`，相同键不同条件返回 409。
+- 创建成功后返回 `202` 与 `QUEUED`；支持 `embedded`（应用内局部轮询刷新）与 `external`（`npm run worker` 租约调度与定时监控）两种执行模式。支持取消排队/执行中的任务，服务异常重启时自动将遗留任务恢复为可重试终态。
+- 分档是确定性规则，不使用模型：已有产品或工厂硬约束存在已知冲突时为 `NOT_FIT`（列入排除记录）；缺少品类、市场/在售证据或达到门槛的已核验证据时为 `NEEDS_INFORMATION`；三者齐备且无硬冲突的待审商机即可进入 `PRIORITY_REVIEW`（优先审核）。
+- 证据质量由规则判定：经人工核验、未过期/未失效且记录为第一方官网/第一方公开记录（`FIRST_PARTY_BRAND`）及明确时间时允许升级至 `HIGH`；第三方来源与一般已核验记录最高为 `MEDIUM`；`min_evidence_quality=HIGH` 可真实筛选达标第一方证据。
+- 研究按严格排序输出候选（证据质量 → 已知发布时间降序 → 可用联系人数 → ID）；已有商机复用且不覆盖人工资格、销售阶段、负责人或历史。联系人缺失记为 `CONTACT_NOT_FOUND`；模型未接入时记录原因，不阻塞任务完成。
+- `GET /api/v1/research-jobs` 列出任务；`GET /api/v1/research-jobs/{id}`、`/results`、`/failures` 查看任务、结果快照（含实时最新草稿状态）和失败项。`POST /{id}/cancel` 与 `POST /{id}/retry` 累加并遵守累计预算，支持 `Idempotency-Key`。
 
 ## 来源页面读取与 SSRF 边界
 
 - 证据录入页的“读取公开页面”必须由用户显式点击。服务端只读取一次，返回清理后的文本供人工核对，不自动抓取、不自动保存，也不把读取当作来源核验。
 - 仅接受 `http`/`https`、无账号密码、无自定义端口、带点号的公开域名；直接拒绝 IP、`localhost`、回环、内网、链路本地、云元数据地址和保留域名后缀。
-- DNS 解析后再次校验所有地址，并把校验过的地址固定到本次连接，降低 DNS 重绑定风险；重定向最多 3 跳，每跳重新校验。
-- 限制 8 秒超时、512 KB 响应体和 20,000 字返回文本；只接受 `text/html`、`application/xhtml+xml`、`text/plain`，拒绝压缩编码和超大响应。
-- 文本通过简单标签/脚本/样式清理和常见实体解码生成，不是完整 HTML 解析器，可能遗漏脚本动态内容；页面仍需人工核对。每 15 分钟最多 30 次读取，按服务进程计数，重启清零。
+- DNS 解析后逐一校验全部候选 IP，支持在已校验 IPv4/IPv6 地址间回退连接，降低 IPv6 不可达及 DNS 重绑定风险；重定向最多 3 跳，每跳重新校验。
+- 限制 8 秒超时，支持 `gzip` / `deflate` / `br` 安全解压（限制最大解压字节），接收 `text/html`、`application/xhtml+xml`、`text/plain` 并解码完整常见英文 HTML 实体；启用 `HEADLESS_RENDER=1` 时可对 SPA 壳页面执行无头浏览器 DOM 提取 fallback。每 15 分钟最多 30 次用户预览读取。
 - `POST /api/v1/sources/preview` 返回最终 URL、状态码、类型、字节数、重定向链和文本；成功与失败都记录元数据审计，不记录页面正文。
-- 证据录入可选择已启用来源并提交 `source_id`：目标域名必须落在该来源的 `base_domains` 内，并按来源的 `rate_limit_per_15m` 单独限速。成功读取会清零连续失败；上游读取连续失败 5 次会把来源自动置为 `DISABLED`，记录最后错误与时间并写入审计。重新启用会清零失败计数。
+- 证据录入可选择已启用来源并提交 `source_id`：目标域名必须落在该来源的 `base_domains` 内，并按来源的 `rate_limit_per_15m` 单独限速。成功读取会清零连续失败；上游读取连续失败 5 次（事务内原子递增）会把来源自动置为 `DISABLED`，记录最后错误与时间并写入审计。重新启用会清零失败计数。
 - 未关联来源的读取仍受每服务进程 15 分钟 30 次的全局限制。自动停用只影响该来源的受治理读取，不删除已保存证据。
 
 ## 备份、恢复与审计
 
-- `npm run backup` 使用 SQLite `VACUUM INTO` 生成一致性快照，默认写入 `data/backups/botein-<UTC 时间>.sqlite`，不写入源库，并拒绝覆盖已有文件。可指定目标：`npm run backup -- /path/snapshot.sqlite`。源库优先取 `DATABASE_PATH`，否则取 `data/botein.sqlite`；若仅存在旧版 `data/signalsniper.sqlite`，则沿用旧库。
-- 备份后自动执行 `PRAGMA integrity_check` 并统计主要表行数；`npm run verify-backup -- <文件>` 可再次校验。完整性不是 `ok` 时进程返回非零。
-- 恢复需停止服务后手动替换数据库文件，并处理同目录的 `-wal`/`-shm` 文件；本版不提供在线恢复接口。恢复后仍由本地负责人登录读取。
-- `GET /api/v1/audit-logs?limit=20&cursor=...` 按 audit rowid 倒序返回当前工作空间元数据，`limit` 为 1–100，cursor 为不透明分页标识。审计详情不包含密码、Cookie 或页面正文。
-- 接入状态页提供“加载最近记录”和“加载更多”。审计是本地追加记录，不提供编辑或删除。
+- **SQLite 模式**：`npm run backup` 使用 `VACUUM INTO` 生成一致性快照，默认写入 `data/backups/botein-<UTC 时间>.sqlite`，拒绝覆盖已有文件并自动执行 `PRAGMA integrity_check` 与主要表行数校验；恢复需停服替换数据库文件及 `-wal`/`-shm` 文件。
+- **PostgreSQL 模式**：当 `.env` 或环境变量启用 `DB_DRIVER=postgres` 且配置 `DATABASE_URL` 时，`npm run backup` 自动调用 `pg_dump --clean --if-exists --no-owner --no-privileges` 生成 `.sql` 一致性备份，并校验转储完整性与核心表行数。
+- `npm run verify-backup -- <文件>` 支持校验 `.sqlite` 与 `.sql` 两种备份；完整性不是 `ok` 时返回非零退出码。
+- `GET /api/v1/audit-logs?limit=20&cursor=...` 按 `rowid` 倒序返回当前工作空间审计元数据，`limit` 为 1–100，详情不包含密码、Cookie 或页面正文。
+- 接入状态页提供“加载最近记录”和“加载更多”。审计为只追加记录，不提供编辑或删除。
 
 ## 业务列表分页
 
@@ -222,104 +195,80 @@ CSV 每个字段加引号并转义内部引号，公式前缀（含前导空白/
 - 证据列表使用“加载更多”。所有主要业务列表均已使用服务端分页；下拉和引用选择使用独立 options 接口或完整选项，服务端每次响应仍受 100 条上限约束。
 - 商机详情内的证据/联系人/活动、草稿版本、研究结果等有界子列表不分页。
 
-## 待办与统计口径
+## 待办、提醒与统计口径
 
-- 待办使用 UTC 时间存储，页面按浏览器时区输入和显示；“今天”按浏览器本地日期判断。截止时间可以在过去，会标为逾期。完成/取消记录关闭时间，重开清除当前关闭时间，历史保存在审计日志；当前负责人固定为本地负责人。
-- 漏斗 `GET /api/v1/analytics/funnel?from=YYYY-MM-DD&to=YYYY-MM-DD&as_of=ISO_UTC`：创建日期按 UTC，起止日均包含，默认近 30 个 UTC 日；`as_of` 默认为当前时间，不接受未来截止时间。
-- 候选队列包含创建时间在范围内且不晚于 `as_of` 的机会，拒绝或归档不删除候选分母。首次结论只取截至 `as_of` 最早的 QUALIFY/REJECT；先拒绝后合格不会改写首次合格率。当前合格/待重评数另行显示为查询时状态。
-- 活动只取 `occurred_at <= as_of` 且当前未作废的记录；允许后补，因此不是不可变的历史报表快照。每个阶段按机会 ID 去重，不以活动次数计客户数，也不强制各行逐级递减。
-- 当前统计固定本地负责人、洗衣凝珠和美国市场，反映人工维护的商机，不包含尚未实现的研究任务归因、团队过滤或 Agent 获客效果。
+- 待办使用 UTC 时间存储，页面按浏览器时区输入和显示；“今天”按浏览器本地日期判断。截止时间可以在过去，会标为逾期；支持 `GET /api/v1/follow-up-tasks/reminders` 到期与逾期提醒汇总，完成/取消保存关闭时间并记录审计。
+- 漏斗 `GET /api/v1/analytics/funnel?from=YYYY-MM-DD&to=YYYY-MM-DD&as_of=ISO_UTC&market=...`：按商机创建时间选取队列并按截止点去重统计，首次结论与当前状态分离；支持按负责人（`by_assignee`）、品类、市场及研究任务（`by_research_job`）下钻分析。
 
 ## 验证
 
 ```bash
 npm run check
 npm test
-npm run backup -- /path/to/snapshot.sqlite
-npm run verify-backup -- /path/to/snapshot.sqlite
+npm run backup
+npm run verify-backup -- <备份文件路径>
+npm run pg-migrate -- --print
 ```
 
-三十五条原生集成测试分别覆盖（业务测试先通过真实登录建立会话）：
+共四十八条原生自动化集成测试（[src/server.test.mjs](src/server.test.mjs)），除基础主路径与安全/分页测试外，另覆盖：
+- 多组织租户隔离、成员邀请与 RBAC 权限隔离、密码重置、TOTP MFA、KMS 信封加密、数据库持久化限流与动态 CORS。
+- 外部 Worker 租约调度、定时监控与通知外发（`worker_leases` / `scheduled_monitors` / `outbound_notifications`）。
+- 商机收件箱多维筛选、AI 调用遥测（P50/P95、Token/成本与拒绝率）、外部连接器凭据加密，以及 PostgreSQL DDL / SQL 转译与 `.sql` 备份校验。
 
-1. 档案保存与启用、CSV 去重/待复核/失败行、原始证据保存以及重启持久化。
-2. 未接入服务时研究被阻断且不创建假任务，同时检查版本冲突、无效 URL 和跨来源写入。
-3. 人工证据核验、商机合格、联系人、发送记录幂等、补录不回退与误录作废主路径。
-4. 未核验/其他品牌证据阻断、证据失效触发重评、版本冲突及邮箱重复录入仍被抑制。
-5. 待办幂等及完成不改变销售阶段；报价按机会去重，作废后按同一截止时间重算，归档保留候选分母。
-6. 空分母、首次拒绝后重开、日期范围/截止时间约束及待办并发冲突。
-7. 人工草稿创建/审批/复制、编辑版本不可覆盖、发送绑定旧版本、重启持久化、工厂修改使批准失效。
-8. 未核验事实阻断、过期依据重审、证据失效/联系人抑制撤销批准及旧复制请求被拦截。
-9. 产品/SKU 去重、原始链接保留、证据可选关联、仅备注修改不撤核验与重启持久化。
-10. 跨品牌关联、身份/版本冲突和范围外证据被拒绝，产品核心资料变化使商机/草稿需重审。
-11. 多行证据 CSV、观察时间、重复导入保留核验状态、公式型内容安全化导出且不修改原文。
-12. 导入错误归属/时间逐行拒绝、无效结构不写入、导出排除其他组织及空集合表头。
-13. 身份核对持久化、重复候选去重、明确新增/复用/排除，不覆盖原资料。
-14. 过期身份判断、跨域误复用与品牌编辑冲突被拒绝；身份修改使证据、联系人、商机和草稿需重审，仅备注修改保持批准。
-15. 联系人修改后历史活动/草稿快照保留、旧批准失效、新版本审核及重启持久化。
-16. 邮箱/品牌迁移被拒绝、旧版本冲突、修改后抑制继续生效及目录范围隔离。
-17. 初始化不修改业务数据、会话重启保留、退出/密码更新撤销旧会话和密码不写审计。
-18. 非法初始化、跨来源请求、伪造/过期会话、统一登录错误和次数限制。
-19. 会话列表不含凭据、重启后标识稳定、指定/其他/当前会话撤销与访问拒绝。
-20. 匿名及跨来源撤销被拒绝、外部负责人/过期/未知目标统一 404，不误撤本次登录。
-21. 品牌池研究按确定性规则分档，复用人工合格商机且不覆盖审核，排除已知品类冲突，HIGH 门槛如实降为待补资料。
-22. 研究边界：不支持的市场/品类、超限数量、未启用工厂和 DISCOVERY 无来源均不创建任务；幂等重放、冲突、取消和重试状态受控。
-23. 来源读取边界：回环/内网/云元数据地址、IP、账号密码、自定义端口和非网页协议在发起请求前即被拒绝。
-24. 来源登记：域名/市场/限速校验、重名冲突、启用确认、停用与再次启用的审计顺序。
-25. 来源核心字段变化退回待启用、仅改备注保持启用；搜索不可用时 DISCOVERY 返回 503 且不创建任务。
-26. 地址分类覆盖 IPv4/IPv6 私有与映射段；HTML 清理移除脚本、样式和注释并解码常见实体。
-27. 备份快照完整性、表计数、拒绝覆盖，以及关闭/重开源库后数据仍可读。
-28. 原文清除：确认与版本检查、商机重评、草稿阻断与引用替换、数据库文件无正文残留、禁止恢复、导出与审计不含正文、重启后仍为清除状态。
-29. 审计日志倒序游标分页、凭据字段不外泄、limit/cursor 边界。
-30. 业务列表复合游标分页：默认/上限、跨页不重复、插入新记录后游标稳定、非法参数拒绝；品牌/联系人搜索、商机状态筛选、待办状态/今天范围筛选、研究任务/来源/身份核对/字段核验/产品总数与 options 接口。
-31. 来源治理：域名范围、每来源限速、连续失败自动停用、重新启用清零与审计。
-32. 自动发现：搜索与模型注入桩，验证只创建 UNVERIFIED 证据和 NEEDS_INFORMATION 结果，不自动创建商机或合格。
-33. AI 草稿：严格引用校验、生成后保持 DRAFT、人工审批通过；伪造引用返回 422 且不新增草稿。
-34. AI 证据分析：事件类型/引用校验、质量规则、历史保留、伪造引用拒绝，以及原文清除后分析内容被清空。
-35. 异步研究任务：创建返回 QUEUED、后台完成、取消后不保存结果。
-
-测试使用临时数据库，不修改 `data/`。浏览器验收也应指定独立的 `DATABASE_PATH`，不要在真实工厂档案中填写测试承诺。
+测试使用临时数据库，不修改 `data/`。浏览器验收请使用独立数据库或临时 PostgreSQL 库。
 
 ## 文件
 
 ```text
-src/server.mjs       本地 HTTP 服务及 API
-src/auth.mjs         本地负责人初始化/登录/会话及密码更新
-src/store.mjs        SQLite 初始化/升级、预填资料、事务与审计
-src/sales.mjs        人工证据核验、商机、联系人与销售活动 API
-src/tracking.mjs     跟进待办与去重销售漏斗 API
-src/research.mjs     研究任务、预算/终态、品牌池分档与自动发现执行
-src/source-fetch.mjs 显式来源页面读取、SSRF 防护与文本清理
-src/sources.mjs      研究来源登记、授权记录、启用/停用与 readiness API
-src/audit.mjs        审计日志游标分页 API
-src/pagination.mjs   业务列表复合游标、limit 校验与分页响应
-src/paths.mjs        默认数据库路径与新/旧路径兼容
-src/search.mjs       SearXNG 搜索客户端与连接状态
-src/model.mjs        Anthropic 兼容模型客户端与严格 JSON 解析
-src/discovery.mjs    搜索、页面读取、模型筛选与自动发现候选
-docker-compose.yml   本地 SearXNG 服务
-search/settings.yml  SearXNG 本地 JSON 搜索配置
-src/maintenance.mjs  一致性备份、完整性校验与表计数
-scripts/backup.mjs   备份命令
-scripts/verify-backup.mjs 备份校验命令
-scripts/ensure-env.mjs 开发启动前补齐本地 .env
-src/analysis.mjs     证据信号分析、严格引用校验与历史记录 API
-src/drafts.mjs       字段核验、人工/AI 草稿版本、审批及复制校验 API
-src/products.mjs     品牌产品/SKU、变更及证据归属 API
-src/accounts.mjs     品牌编辑、身份核对和依赖状态处理
-src/contacts.mjs     联系人编辑/历史、目录及抑制列表
-src/evidence.mjs     手工和 CSV 共用的证据写入规则
-src/data-transfer.mjs 证据 CSV 导入与业务 CSV 导出
-src/validation.mjs   输入验证及 CSV 解析
-src/server.test.mjs  三十五条相关行为测试
-public/index.html   页面、表单和原生对话框
-public/app.js       页面状态与 API 调用
-public/auth.js      登录入口、退出与密码修改交互
-public/drafts.js    商机内草稿编辑/审核及字段核验交互
-public/products.js  品牌产品编辑、变更历史与证据关联交互
-public/accounts.js  品牌编辑及同域名身份核对交互
-public/contacts.js  联系人编辑与目录交互
-public/data-transfer.js  CSV 模板、导入反馈与下载
-public/style.css    页面布局与响应式样式
+src/server.mjs             HTTP 服务、安全响应头与 REST API 路由
+src/auth.mjs               多租户认证、RBAC、邀请、密码重置、TOTP MFA 与会话管理
+src/store.mjs              存储入口、SQLite 初始化/v17 升级、PostgreSQL 自动路由与事务审计
+src/storage.mjs            storage 配置、PostgreSQL v17 DDL 导出与 SQLite → PostgreSQL 数据迁移
+src/pg-store.mjs           PostgreSQL 同步适配器与 SQLite 方言转译层
+src/pg-worker.mjs          零第三方依赖 Node Worker PostgreSQL v3 协议客户端
+src/catalog.mjs            环境变量驱动的产品品类与目标市场配置目录
+src/fit.mjs                基于工厂条款与资质的确定性硬约束匹配引擎
+src/connectors.mjs         加密存储的外部联系人/电商/邮件/Webhook 连接器
+src/kms.mjs                AES-256-GCM 信封加密与 TOTP 工具
+src/worker.mjs             独立后台任务租约执行与定时监控调度循环
+src/sales.mjs              证据核验、商机、联系人与销售活动 API
+src/tracking.mjs           跟进待办提醒与多维漏斗统计 API
+src/research.mjs           研究任务、预算/崩溃恢复、分档排序与自动发现编排
+src/source-fetch.mjs       SSRF 防护、多 IP 回退、安全解压与 Headless Chrome DOM 抓取
+src/sources.mjs            研究来源登记、授权记录与失败熔断 API
+src/audit.mjs              审计日志游标分页 API
+src/pagination.mjs         业务列表复合游标、limit 校验与分页响应
+src/paths.mjs              默认数据库路径与新/旧路径兼容
+src/search.mjs             SearXNG 搜索客户端与连接状态
+src/model.mjs              Anthropic 兼容模型客户端与平衡括号 JSON 解析
+src/discovery.mjs          自动发现查询池、页面聚合、SKU 提取与全链路候选创建
+src/analysis.mjs           AI 证据信号分析、严格引用校验与历史记录 API
+src/contact-discovery.mjs  品牌官网公开联系人发现
+src/drafts.mjs             字段核验、人工/AI 草稿版本、审批及复制校验 API
+src/products.mjs           品牌产品/SKU、变更及证据归属 API
+src/accounts.mjs           品牌编辑、身份核对和依赖状态处理
+src/contacts.mjs           联系人编辑/历史、目录与受控禁联解除
+src/evidence.mjs           来源属性与可达性（source_kind / availability_status）共用的证据规则
+src/data-transfer.mjs      证据 CSV 导入与公式安全 CSV 导出
+src/maintenance.mjs        SQLite VACUUM INTO 与 PostgreSQL pg_dump 一致性备份及校验
+src/validation.mjs         输入验证及 CSV 解析
+src/server.test.mjs        48 条集成与单元测试
+scripts/backup.mjs         SQLite/PostgreSQL 备份命令
+scripts/verify-backup.mjs  SQLite/PostgreSQL 备份校验命令
+scripts/pg-migrate.mjs     PostgreSQL 建表与 SQLite 全量迁移脚本
+scripts/worker.mjs         独立外部研究/监控 Worker 启动入口
+scripts/ensure-env.mjs     开发启动前补齐本地 .env
+docker-compose.yml         本地 SearXNG 服务
+search/settings.yml        SearXNG 本地 JSON 搜索配置
+public/index.html          单页控制台布局、表单与原生对话框
+public/app.js              页面路由、局部刷新与各工作区控制器
+public/auth.js             登录/注册/邀请/密码重置与 MFA 交互
+public/drafts.js           划词引用草稿编辑器、跟进模板与字段核验交互
+public/products.js         品牌产品编辑、变更历史与证据关联交互
+public/accounts.js         品牌编辑及同域名身份核对交互
+public/contacts.js         联系人编辑、目录与受控解除禁联交互
+public/data-transfer.js    CSV 模板、UTF-8 严格导入反馈与导出
+public/style.css           页面布局与响应式样式
 ```
 
 UI 遵循用户的 `design.md`：Geist、克制层级、来源可追溯、系统深浅色。`public/assets/vercel-brand.css` 原样取自 https://vercel.com/geist/vercel-brand.css（2026-11-12），作为基础样式；页面品牌为 Botein，不表示 Vercel 官方出品。字体通过 Google Fonts 加载，离线时使用系统字体。应用不加载第三方脚本或分析服务。

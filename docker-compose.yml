@@ -9,3 +9,25 @@ services:
     environment:
       - SEARXNG_BASE_URL=http://127.0.0.1:8888/
     restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    container_name: botein-postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-botein}
+      - POSTGRES_USER=${POSTGRES_USER:-botein}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-botein_dev_password}
+    volumes:
+      - botein_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-botein} -d ${POSTGRES_DB:-botein}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  botein_pgdata:

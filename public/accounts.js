@@ -1,6 +1,6 @@
 const $ = selector => document.querySelector(selector);
 const statusLabels = { PENDING: '待核对', DISTINCT: '已确认为独立品牌', REUSED: '已复用现有品牌', REJECTED: '已排除' };
-export function setupAccounts({ api, state, refresh, notify, escape, formHandler, date }) {
+export function setupAccounts({ api, state, refresh, refreshScope = () => refresh(), notify, escape, formHandler, date }) {
   const clearError = form => { form.querySelector('.sn-form-error').hidden = true; form.querySelectorAll('[aria-invalid]').forEach(e => e.removeAttribute('aria-invalid')); };
   function candidateMarkup(c) {
     return `<h3>${escape(c.brand_name)}</h3><p><a href="${escape(c.website)}" target="_blank" rel="noopener noreferrer">${escape(c.website)}</a></p><p class="sn-helper">总部国家：${escape(c.headquarters_country || '未知')}<br>备注：${escape(c.notes || '未填写')}</p>`;
@@ -28,7 +28,7 @@ export function setupAccounts({ api, state, refresh, notify, escape, formHandler
   }
   formHandler('#account-edit-form', async form => {
     const result = await api(`/accounts/${form.dataset.id}`, 'PATCH', { ...Object.fromEntries(new FormData(form)), expected_version: Number(form.dataset.version), shared_domain_confirmed: form.elements.shared_domain_confirmed.checked });
-    await refresh(); $('#account-edit-dialog').close(); notify(result.unchanged ? '资料未变化。' : '品牌资料已更新，涉及身份变更的资料需要重新核验。');
+    await refreshScope('accounts', 'evidence', 'opportunities', 'detail'); $('#account-edit-dialog').close(); notify(result.unchanged ? '资料未变化。' : '品牌资料已更新，涉及身份变更的资料需要重新核验。');
   });
   function updateAction() {
     const form = $('#identity-form'), action = form.elements.action.value;
@@ -50,7 +50,7 @@ export function setupAccounts({ api, state, refresh, notify, escape, formHandler
     data.expected_version = Number(form.dataset.version); data.confirmed = form.elements.confirmed.checked;
     data.target_expected_version = Number(form.elements.target_account_id.selectedOptions[0]?.dataset.version);
     await api(`/account-identity-reviews/${form.dataset.id}/resolve`, 'POST', data);
-    await refresh(); $('#identity-dialog').close(); notify('身份结论已保存。已有品牌、产品和销售历史未被搬移或合并。');
+    await refreshScope('identities', 'accounts', 'opportunities', 'detail'); $('#identity-dialog').close(); notify('身份结论已保存。已有品牌、产品和销售历史未被搬移或合并。');
   });
   document.addEventListener('click', event => {
     const edit = event.target.closest('[data-account-edit]'); if (edit) openEdit(edit.dataset.accountEdit).catch(e => notify(e.message));

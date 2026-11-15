@@ -1,15 +1,23 @@
 import { BlockList, isIP } from 'node:net';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { lookup } from 'node:dns/promises';
+import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib';
 import http from 'node:http';
 import https from 'node:https';
+import { checkAndRecordRateLimit } from './store.mjs';
 import { AppError } from './validation.mjs';
 
+const execFileAsync = promisify(execFile);
+
 const MAX_BYTES = 512 * 1024;
+const MAX_DECOMPRESSED_BYTES = 2 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const TIMEOUT_MS = 8_000;
 const MAX_TEXT = 20_000;
 const WINDOW_MS = 15 * 60_000;
-const MAX_FETCHES = 30;
+const MAX_PREVIEW_FETCHES = 30;
+const MAX_BACKGROUND_FETCHES = 120;
 
 const blocked = new BlockList();
 for (const [network, prefix] of [
@@ -22,6 +30,15 @@ for (const [network, prefix] of [
   ['::', 128], ['::1', 128], ['64:ff9b::', 96], ['100::', 64], ['2001:db8::', 32],
   ['fc00::', 7], ['fe80::', 10], ['ff00::', 8],
 ]) blocked.addSubnet(network, prefix, 'ipv6');
+
+const NAMED_ENTITIES = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+  ndash: '–', mdash: '—', hellip: '…', lsquo: '‘', rsquo: '’',
+  ldquo: '“', rdquo: '”', bull: '•', middot: '·', copy: '©',
+  reg: '®', trade: '™', deg: '°', euro: '€', pound: '£',
+  yen: '¥', cent: '¢', times: '×', divide: '÷', plusmn: '±',
+  laquo: '«', raquo: '»',
+};
 
 export function isBlockedAddress(value) {
   if (typeof value !== 'string') return true;
@@ -63,10 +80,19 @@ function metaContent(html, attribute, name) {
 
 export function extractPageMeta(html) {
   const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? '';
+  const emails = new Set();
+  for (const match of html.matchAll(/href\s*=\s*["']mailto:([^"'?]+)/gi)) {
+    try {
+      const email = decodeURIComponent(match[1]).trim().toLowerCase();
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) emails.add(email);
+    } catch { /* ignore malformed mailto values */ }
+    if (emails.size >= 10) break;
+  }
   return {
     title: htmlToText(title).text.slice(0, 300),
     site_name: htmlToText(metaContent(html, 'property', 'og:site_name')).text.slice(0, 200),
     description: htmlToText(metaContent(html, 'name', 'description')).text.slice(0, 500),
+    emails: [...emails],
   };
 }
 
@@ -86,8 +112,7 @@ export function htmlToText(input) {
           return match;
         }
       } catch { return match; }
-      const named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
-      return named[code.toLowerCase()] ?? match;
+      return NAMED_ENTITIES[code.toLowerCase()] ?? match;
     })
     .replace(/[ \t\f\v]+/g, ' ')
     .replace(/ *\n */g, '\n')
@@ -96,15 +121,18 @@ export function htmlToText(input) {
   return { text: text.slice(0, MAX_TEXT), truncated: text.length > MAX_TEXT };
 }
 
-const attempts = [];
-function allowFetch() {
+const previewAttempts = [];
+const backgroundAttempts = [];
+function allowFetch(bucket = 'preview') {
+  const store = bucket === 'background' ? backgroundAttempts : previewAttempts;
+  const max = bucket === 'background' ? MAX_BACKGROUND_FETCHES : MAX_PREVIEW_FETCHES;
   const now = Date.now();
-  while (attempts.length && now - attempts[0] > WINDOW_MS) attempts.shift();
-  if (attempts.length >= MAX_FETCHES) throw new AppError(429, 'SOURCE_RATE_LIMITED', '读取来源过于频繁，请稍后再试。');
-  attempts.push(now);
+  while (store.length && now - store[0] > WINDOW_MS) store.shift();
+  if (store.length >= max) throw new AppError(429, 'SOURCE_RATE_LIMITED', '读取来源过于频繁，请稍后再试。');
+  store.push(now);
 }
 
-async function resolvePublic(hostname) {
+async function resolvePublicRecords(hostname) {
   let records;
   try { records = await lookup(hostname, { all: true, verbatim: true }); }
   catch { throw new AppError(422, 'SOURCE_UNRESOLVED', '无法解析来源域名。', 'url'); }
@@ -114,21 +142,34 @@ async function resolvePublic(hostname) {
       throw new AppError(422, 'SOURCE_BLOCKED', '来源解析到本机、内网或保留地址，已拒绝访问。', 'url');
     }
   }
-  return records[0];
+  const unique = [];
+  const seen = new Set();
+  for (const record of records) {
+    if (seen.has(record.address)) continue;
+    seen.add(record.address);
+    unique.push(record);
+  }
+  unique.sort((a, b) => (isIP(a.address) === 4 ? 0 : 1) - (isIP(b.address) === 4 ? 0 : 1));
+  return unique;
 }
 
-function requestOnce(url, address) {
+function requestOnce(url, address, signal) {
   const family = isIP(address) === 6 ? 6 : 4;
   const transport = url.protocol === 'https:' ? https : http;
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new AppError(499, 'RESEARCH_CANCELLED', '抓取任务已取消。', 'url'));
+      return;
+    }
     const request = transport.request({
       protocol: url.protocol, hostname: url.hostname,
       port: url.port || (url.protocol === 'https:' ? 443 : 80),
       path: `${url.pathname}${url.search}`, method: 'GET',
+      signal,
       headers: {
         'User-Agent': 'BoteinLocal/0.1 (local workspace; user-initiated page read)',
         Accept: 'text/html,application/xhtml+xml,text/plain;q=0.9',
-        'Accept-Encoding': 'identity',
+        'Accept-Encoding': 'gzip, deflate, br, identity',
       },
       // Pin the DNS answer that was just validated, so a second lookup cannot
       // rebind the connection to a private address.
@@ -138,14 +179,47 @@ function requestOnce(url, address) {
       },
     }, response => resolve(response));
     request.setTimeout(TIMEOUT_MS, () => request.destroy(new AppError(504, 'SOURCE_TIMEOUT', '读取来源超时。', 'url')));
-    request.on('error', error => reject(error instanceof AppError ? error : new AppError(502, 'SOURCE_FETCH_FAILED', '无法读取来源页面。', 'url')));
+    request.on('error', error => {
+      if (error?.name === 'AbortError' || signal?.aborted) {
+        reject(new AppError(499, 'RESEARCH_CANCELLED', '抓取任务已取消。', 'url'));
+        return;
+      }
+      reject(error instanceof AppError ? error : new AppError(502, 'SOURCE_FETCH_FAILED', '无法读取来源页面。', 'url'));
+    });
     request.end();
   });
 }
 
+async function requestWithFallback(url, records, signal) {
+  let lastError = null;
+  for (const record of records) {
+    try {
+      return await requestOnce(url, record.address, signal);
+    } catch (error) {
+      if (error?.code === 'RESEARCH_CANCELLED') throw error;
+      lastError = error;
+    }
+  }
+  throw lastError || new AppError(502, 'SOURCE_FETCH_FAILED', '无法读取来源页面。', 'url');
+}
+
+function decompressBody(buffer, encoding, maxBytes) {
+  const normalized = String(encoding || 'identity').split(',')[0].trim().toLowerCase();
+  if (!normalized || normalized === 'identity') return buffer;
+  const maxOutputLength = Math.max(maxBytes * 2, MAX_DECOMPRESSED_BYTES);
+  try {
+    if (normalized === 'gzip' || normalized === 'x-gzip') return gunzipSync(buffer, { maxOutputLength });
+    if (normalized === 'deflate') return inflateSync(buffer, { maxOutputLength });
+    if (normalized === 'br') return brotliDecompressSync(buffer, { maxOutputLength });
+  } catch {
+    throw new AppError(413, 'SOURCE_TOO_LARGE', '来源页面解压失败或超过允许大小限制。', 'url');
+  }
+  throw new AppError(415, 'SOURCE_ENCODING_UNSUPPORTED', '来源使用了不支持的压缩编码。', 'url');
+}
+
 async function readBody(response, maxBytes) {
-  const encoding = String(response.headers['content-encoding'] || 'identity').toLowerCase();
-  if (encoding !== 'identity') {
+  const encoding = String(response.headers['content-encoding'] || 'identity').split(',')[0].trim().toLowerCase();
+  if (!['identity', 'gzip', 'x-gzip', 'deflate', 'br'].includes(encoding)) {
     response.resume();
     throw new AppError(415, 'SOURCE_ENCODING_UNSUPPORTED', '来源使用了不支持的压缩编码。', 'url');
   }
@@ -168,18 +242,52 @@ async function readBody(response, maxBytes) {
     }
     chunks.push(chunk);
   }
-  return { type, buffer: Buffer.concat(chunks), size };
+  const rawBuffer = Buffer.concat(chunks);
+  const decodedBuffer = decompressBody(rawBuffer, encoding, maxBytes);
+  return { type, buffer: decodedBuffer, size: rawBuffer.length };
 }
 
-export async function fetchPublicPage(input, { maxBytes = MAX_BYTES } = {}) {
+function isLikelySpaShell(html, extractedText) {
+  return String(extractedText || '').length < 140
+    && /<(?:div|main|section)[^>]+(?:id|data-reactroot|ng-app)[=\s"']*(?:root|app|__next|__nuxt)?/i.test(String(html || ''));
+}
+
+export async function renderSpaWithChrome(targetUrl, pinnedAddress, { chromeBin = process.env.CHROME_BIN || 'google-chrome', signal } = {}) {
+  const host = targetUrl.hostname;
+  const { stdout } = await execFileAsync(chromeBin, [
+    '--headless=new',
+    '--disable-gpu',
+    '--no-sandbox',
+    '--disable-dev-shm-usage',
+    '--dump-dom',
+    `--host-resolver-rules=MAP ${host} ${pinnedAddress}`,
+    targetUrl.href,
+  ], { timeout: TIMEOUT_MS, maxBuffer: MAX_DECOMPRESSED_BYTES, signal });
+  return String(stdout || '');
+}
+
+export async function fetchPublicPage(input, {
+  maxBytes = MAX_BYTES, signal, bypassGlobalRateLimit = false, rateBucket = 'preview',
+  rateLimitDb = null, headlessFallback = process.env.HEADLESS_RENDER === '1', spaRenderer = renderSpaWithChrome,
+} = {}) {
   if (typeof input !== 'string' || !input.trim()) throw new AppError(422, 'INVALID_URL', '请填写来源网址。', 'url');
+  if (signal?.aborted) throw new AppError(499, 'RESEARCH_CANCELLED', '抓取任务已取消。', 'url');
   let current = sourceUrl(input.trim());
-  allowFetch();
+  if (!bypassGlobalRateLimit) {
+    if (rateLimitDb) {
+      const limit = rateBucket === 'background' ? MAX_BACKGROUND_FETCHES : MAX_PREVIEW_FETCHES;
+      if (!checkAndRecordRateLimit(rateLimitDb, `fetch:${rateBucket}`, 'global', limit, WINDOW_MS).allowed) {
+        throw new AppError(429, 'SOURCE_RATE_LIMITED', `每 15 分钟最多读取 ${limit} 个公开页面，请稍后再试。`, 'url');
+      }
+    } else {
+      allowFetch(rateBucket);
+    }
+  }
   const chain = [];
   try {
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-      const { address } = await resolvePublic(current.hostname);
-      const response = await requestOnce(current, address);
+      const records = await resolvePublicRecords(current.hostname);
+      const response = await requestWithFallback(current, records, signal);
       if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
         const location = response.headers.location;
         response.resume();
@@ -193,13 +301,25 @@ export async function fetchPublicPage(input, { maxBytes = MAX_BYTES } = {}) {
         throw new AppError(502, 'SOURCE_HTTP_ERROR', `来源页面返回 ${response.statusCode}。`, 'url');
       }
       const body = await readBody(response, maxBytes);
-      const html = body.buffer.toString('utf8');
-      const extracted = htmlToText(html);
+      let html = body.buffer.toString('utf8');
+      let extracted = htmlToText(html);
+      let extraction = 'SIMPLE_TAG_STRIP';
+      if (headlessFallback && isLikelySpaShell(html, extracted.text)) {
+        try {
+          const renderedHtml = await spaRenderer(current, records[0].address, { signal });
+          const renderedExtracted = htmlToText(renderedHtml);
+          if (renderedExtracted.text.length > extracted.text.length) {
+            html = renderedHtml;
+            extracted = renderedExtracted;
+            extraction = 'HEADLESS_CHROME_DOM';
+          }
+        } catch { /* fall back gracefully to static HTML */ }
+      }
       return {
         requested_url: input.trim(), final_url: current.href, status_code: response.statusCode,
         content_type: body.type, byte_length: body.size, redirect_count: chain.length,
         redirect_chain: chain, fetched_at: new Date().toISOString(), text: extracted.text,
-        truncated: extracted.truncated, extraction: 'SIMPLE_TAG_STRIP', metadata: extractPageMeta(html),
+        truncated: extracted.truncated, extraction, metadata: extractPageMeta(html),
       };
     }
     throw new AppError(422, 'SOURCE_REDIRECT_LIMIT', '来源重定向次数过多，未继续读取。', 'url');

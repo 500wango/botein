@@ -5,7 +5,7 @@ function download(blob, filename) {
   document.body.append(anchor); anchor.click(); anchor.remove();
   setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
-export function setupTransfer({ api, state, refresh, notify, escape, formHandler }) {
+export function setupTransfer({ api, state, refresh, refreshScope = () => refresh(), notify, escape, formHandler }) {
   function prepareImport() {
     $('#evidence-import-results').replaceChildren();
     $('#import-account-reference').innerHTML = state.accountOptions.length ? `<ul class="sn-history">${state.accountOptions.map(a => `<li>${escape(a.brand_name)}<br><code>${escape(a.id)}</code></li>`).join('')}</ul>` : '<p class="sn-helper">尚无品牌，请先在品牌池录入。即使导入文件提供未知 ID，也不会自动创建品牌。</p>';
@@ -18,7 +18,11 @@ export function setupTransfer({ api, state, refresh, notify, escape, formHandler
     try {
       const result = await fetch(`/api/v1/exports/${encodeURIComponent(button.dataset.export)}`);
       if (result.status === 401) window.dispatchEvent(new Event('sn-auth-expired'));
-      if (!result.ok) throw new Error((await result.json()).error?.message || '导出失败，请重试。');
+      if (!result.ok) {
+        let message = `导出失败 (${result.status})，请重试。`;
+        try { message = (await result.json()).error?.message || message; } catch {}
+        throw new Error(message);
+      }
       const filename = result.headers.get('content-disposition')?.match(/filename="([a-z0-9.-]+)"/i)?.[1] || 'botein-export.csv';
       download(await result.blob(), filename);
       feedback.textContent = `已准备下载 ${filename}，范围为当前工作空间全部记录。`;
@@ -37,7 +41,7 @@ export function setupTransfer({ api, state, refresh, notify, escape, formHandler
     $('#evidence-import-results').innerHTML = `<p>新增 ${result.counts.CREATED} · 跳过 ${result.counts.SKIPPED} · 失败 ${result.counts.FAILED}</p><ul>${result.results.map(row => `<li>第 ${row.row} 条记录：${labels[row.status]}，${escape(row.reason)}${row.id ? `<br>证据 ID：${escape(row.id)}` : ''}</li>`).join('')}</ul><p class="sn-helper">失败记录未写入。修改后可重新提交，相同证据会跳过；未自动核验任何来源。</p>`;
     $('#evidence-import-results').scrollIntoView({ block: 'nearest' });
     // Keep the import result visible even if a subsequent page refresh fails.
-    try { await refresh(); } catch (error) { notify(`导入结果已保存，但列表刷新失败：${error.message}`); }
+    try { await refreshScope('evidence', 'detail'); } catch (error) { notify(`导入结果已保存，但列表刷新失败：${error.message}`); }
   });
   return { prepareImport };
 }

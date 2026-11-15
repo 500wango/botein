@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { ORG, audit, transaction } from './store.mjs';
+import { actorUsername, audit, requestContext, resolveAssignee, transaction } from './store.mjs';
 import { AppError, requireValue, text } from './validation.mjs';
 import { newerThan, pageParams, pageRows } from './pagination.mjs';
 
@@ -18,12 +18,35 @@ function dateOnly(value, field) {
 function taskData(body) {
   return { title: text(body.title, 'title', 160), notes: text(body.notes ?? '', 'notes', 2000, false), due_at: timestamp(body.due_at, 'due_at') };
 }
-function task(db, id) {
-  const row = db.prepare('SELECT * FROM follow_up_tasks WHERE organization_id=? AND id=?').get(ORG, id);
+function task(db, id, orgId) {
+  const row = db.prepare('SELECT * FROM follow_up_tasks WHERE organization_id=? AND id=?').get(orgId, id);
   requireValue(row, '待办不存在。', undefined, 404, 'NOT_FOUND');
   return row;
 }
-export function trackingApi(db, path, method, body, query) {
+export function trackingApi(db, path, method, body, query, ctx = null) {
+  const { orgId, actor } = requestContext(ctx);
+  if (path === '/follow-up-tasks/reminders' && method === 'GET') {
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const soonIso = new Date(now.getTime() + 24 * 3600 * 1000).toISOString();
+    const rows = db.prepare(`SELECT t.*, a.brand_name, o.sales_stage
+      FROM follow_up_tasks t
+      JOIN opportunities o ON o.id=t.opportunity_id AND o.organization_id=t.organization_id
+      JOIN accounts a ON a.id=o.account_id AND a.organization_id=o.organization_id
+      WHERE t.organization_id=? AND t.status='OPEN' AND t.due_at<=?
+      ORDER BY t.due_at ASC, t.id ASC LIMIT 20`).all(orgId, soonIso);
+    const overdue = rows.filter(r => r.due_at < nowIso);
+    const dueSoon = rows.filter(r => r.due_at >= nowIso);
+    return {
+      status: 200,
+      body: {
+        generated_at: nowIso,
+        overdue_count: overdue.length,
+        due_soon_count: dueSoon.length,
+        items: rows.map(r => ({ ...r, reminder_level: r.due_at < nowIso ? 'OVERDUE' : 'DUE_SOON' })),
+      },
+    };
+  }
   if (path === '/follow-up-tasks' && method === 'GET') {
     const { limit, cursor } = pageParams(query);
     const status = query.get('status') ?? 'ALL';
@@ -38,16 +61,21 @@ export function trackingApi(db, path, method, body, query) {
       requireValue(from < to, '今天的时间范围无效。', 'from');
       filter = "AND t.status = 'OPEN' AND t.due_at >= ? AND t.due_at < ?"; filterParams = [from, to];
     }
+    const assigned = query.get('assigned_to');
+    if (assigned) {
+      filter += ' AND t.assigned_to = ?';
+      filterParams.push(String(assigned).trim().slice(0, 64));
+    }
     const total = db.prepare(`SELECT count(*) AS n FROM follow_up_tasks t WHERE t.organization_id=? ${filter}`)
-      .get(ORG, ...filterParams).n;
+      .get(orgId, ...filterParams).n;
     const base = `SELECT t.*, a.brand_name, o.qualification_status, o.sales_stage
       FROM follow_up_tasks t JOIN opportunities o ON o.id=t.opportunity_id AND o.organization_id=t.organization_id
       JOIN accounts a ON a.id=o.account_id AND a.organization_id=o.organization_id
       WHERE t.organization_id=? ${filter}`;
     const rows = cursor === null
-      ? db.prepare(`${base} ORDER BY t.due_at ASC, t.id ASC LIMIT ?`).all(ORG, ...filterParams, limit + 1)
+      ? db.prepare(`${base} ORDER BY t.due_at ASC, t.id ASC LIMIT ?`).all(orgId, ...filterParams, limit + 1)
       : db.prepare(`${base} AND ${newerThan('t.due_at', 't.id')} ORDER BY t.due_at ASC, t.id ASC LIMIT ?`)
-        .all(ORG, ...filterParams, cursor[0], cursor[0], cursor[1], limit + 1);
+        .all(orgId, ...filterParams, cursor[0], cursor[0], cursor[1], limit + 1);
     return { status: 200, body: { ...pageRows(rows, limit, row => [row.due_at, row.id]), total, generated_at: new Date().toISOString() } };
   }
   if (path === '/follow-up-tasks' && method === 'POST') {
@@ -55,45 +83,50 @@ export function trackingApi(db, path, method, body, query) {
     const opportunityId = text(body.opportunity_id, 'opportunity_id', 100);
     const hash = createHash('sha256').update(JSON.stringify({ opportunityId, ...data })).digest('hex');
     return transaction(db, () => {
-      requireValue(db.prepare('SELECT id FROM opportunities WHERE id=? AND organization_id=?').get(opportunityId, ORG), '商机不存在。', 'opportunity_id', 404, 'NOT_FOUND');
-      const existing = db.prepare('SELECT * FROM follow_up_tasks WHERE organization_id=? AND idempotency_key=?').get(ORG, idempotencyKey);
+      requireValue(db.prepare('SELECT id FROM opportunities WHERE id=? AND organization_id=?').get(opportunityId, orgId), '商机不存在。', 'opportunity_id', 404, 'NOT_FOUND');
+      const assignedTo = resolveAssignee(db, orgId, body.assigned_to, actorUsername(actor));
+      const existing = db.prepare('SELECT * FROM follow_up_tasks WHERE organization_id=? AND idempotency_key=?').get(orgId, idempotencyKey);
       if (existing) {
         requireValue(existing.request_hash === hash, '相同提交标识对应不同内容，请重新打开表单。', undefined, 409, 'IDEMPOTENCY_CONFLICT');
         return { status: 200, body: { ...existing, replayed: true } };
       }
       const id = randomUUID(), now = new Date().toISOString();
-      db.prepare(`INSERT INTO follow_up_tasks (id,organization_id,opportunity_id,title,notes,due_at,idempotency_key,request_hash,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)`).run(id, ORG, opportunityId, data.title, data.notes, data.due_at, idempotencyKey, hash, now, now);
-      audit(db, 'FOLLOW_UP_CREATED', id, { opportunity_id: opportunityId, ...data });
-      return { status: 201, body: task(db, id) };
+      db.prepare(`INSERT INTO follow_up_tasks (id,organization_id,opportunity_id,title,notes,due_at,assigned_to,idempotency_key,request_hash,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(id, orgId, opportunityId, data.title, data.notes, data.due_at, assignedTo, idempotencyKey, hash, now, now);
+      audit(db, 'FOLLOW_UP_CREATED', id, { opportunity_id: opportunityId, assigned_to: assignedTo, ...data }, ctx);
+      return { status: 201, body: task(db, id, orgId) };
     });
   }
   const match = path.match(/^\/follow-up-tasks\/([^/]+)$/);
   if (match && method === 'PATCH') {
     return transaction(db, () => {
-      const current = task(db, match[1]);
+      const current = task(db, match[1], orgId);
       requireValue(body.expected_version === current.version, '待办已更新，请重新打开后操作。', undefined, 409, 'VERSION_CONFLICT');
       const data = taskData({ ...current, ...body });
       const status = body.status ?? current.status;
       requireValue(['OPEN', 'DONE', 'CANCELLED'].includes(status), '请选择有效待办状态。', 'status');
       if (body.opportunity_id !== undefined) requireValue(body.opportunity_id === current.opportunity_id, '已创建的待办不能转移商机。', 'opportunity_id');
+      const currentAssignee = current.assigned_to === 'LOCAL_OWNER' ? '' : current.assigned_to;
+      const assignedTo = resolveAssignee(db, orgId, body.assigned_to, currentAssignee);
       const reason = text(body.reason ?? '', 'reason', 1000, status !== current.status);
       const now = new Date().toISOString();
       const closedAt = status === 'OPEN' ? null : status === current.status ? current.closed_at : now;
-      db.prepare('UPDATE follow_up_tasks SET title=?,notes=?,due_at=?,status=?,closed_at=?,version=version+1,updated_at=? WHERE id=? AND organization_id=?')
-        .run(data.title, data.notes, data.due_at, status, closedAt, now, current.id, ORG);
+      db.prepare('UPDATE follow_up_tasks SET title=?,notes=?,due_at=?,status=?,assigned_to=?,closed_at=?,version=version+1,updated_at=? WHERE id=? AND organization_id=?')
+        .run(data.title, data.notes, data.due_at, status, assignedTo, closedAt, now, current.id, orgId);
       audit(db, 'FOLLOW_UP_UPDATED', current.id, {
         opportunity_id: current.opportunity_id, reason,
-        before: { title: current.title, notes: current.notes, due_at: current.due_at, status: current.status }, after: { ...data, status },
-      });
-      return { status: 200, body: task(db, current.id) };
+        before: { title: current.title, notes: current.notes, due_at: current.due_at, status: current.status, assigned_to: current.assigned_to },
+        after: { ...data, status, assigned_to: assignedTo },
+      }, ctx);
+      return { status: 200, body: task(db, current.id, orgId) };
     });
   }
-  if (path === '/analytics/funnel' && method === 'GET') return { status: 200, body: funnel(db, query) };
+  if (path === '/analytics/funnel' && method === 'GET') return { status: 200, body: funnel(db, query, ctx) };
   throw new AppError(404, 'NOT_FOUND', '接口不存在。');
 }
 
-function funnel(db, query) {
+function funnel(db, query, ctx = null) {
+  const { orgId } = requestContext(ctx);
   const generated = new Date(), today = generated.toISOString().slice(0, 10);
   const defaultFrom = new Date(generated.getTime() - 29 * 86400000).toISOString().slice(0, 10);
   const from = query.get('from') ?? defaultFrom, to = query.get('to') ?? today;
@@ -103,20 +136,68 @@ function funnel(db, query) {
   requireValue(asOf <= generated.toISOString(), '观察截止时间不能在未来。', 'as_of');
   requireValue(to <= asOf.slice(0, 10), '创建日期结束日不能晚于观察截止日。', 'to');
   const endExclusive = new Date(endDay.getTime() + 86400000).toISOString();
-  const rows = db.prepare(`SELECT o.id, o.qualification_status,
+  const filterAssigned = query.get('assigned_to')?.trim() || '';
+  const filterCategory = query.get('product_category')?.trim() || '';
+  const filterMarket = query.get('market')?.trim().toUpperCase() || 'ALL';
+  let oppWhere = 'WHERE o.organization_id=? AND o.created_at>=? AND o.created_at<? AND o.created_at<=?';
+  const oppParams = [orgId, start.toISOString(), endExclusive, asOf];
+  if (filterAssigned) { oppWhere += ' AND o.assigned_to=?'; oppParams.push(filterAssigned); }
+  if (filterCategory) { oppWhere += ' AND o.product_category=?'; oppParams.push(filterCategory); }
+  if (filterMarket && filterMarket !== 'ALL') {
+    oppWhere += ` AND (EXISTS (
+      SELECT 1 FROM accounts a WHERE a.organization_id=o.organization_id AND a.id=o.account_id AND UPPER(a.headquarters_country)=?
+    ) OR EXISTS (
+      SELECT 1 FROM account_products p WHERE p.organization_id=o.organization_id AND p.account_id=o.account_id AND UPPER(p.marketplace)=?
+    ))`;
+    oppParams.push(filterMarket, filterMarket);
+  }
+
+  const rows = db.prepare(`SELECT o.id, o.qualification_status, o.assigned_to, o.product_category,
     (SELECT h.action FROM opportunity_history h WHERE h.organization_id=o.organization_id AND h.opportunity_id=o.id
       AND h.action IN ('QUALIFY','REJECT') AND h.created_at<=? ORDER BY h.created_at, h.rowid LIMIT 1) AS first_decision
-    FROM opportunities o WHERE o.organization_id=? AND o.created_at>=? AND o.created_at<? AND o.created_at<=?`)
-    .all(asOf, ORG, start.toISOString(), endExclusive, asOf);
+    FROM opportunities o ${oppWhere}`)
+    .all(asOf, ...oppParams);
   const activities = db.prepare(`SELECT s.opportunity_id, s.activity_type, s.reply_sentiment FROM sales_activities s
     JOIN opportunities o ON o.id=s.opportunity_id AND o.organization_id=s.organization_id
-    WHERE o.organization_id=? AND o.created_at>=? AND o.created_at<? AND o.created_at<=?
-      AND s.occurred_at<=? AND s.voided_at IS NULL`).all(ORG, start.toISOString(), endExclusive, asOf, asOf);
+    ${oppWhere} AND s.occurred_at<=? AND s.voided_at IS NULL`).all(...oppParams, asOf);
   const countActivity = (type, sentiment) => new Set(activities.filter(a => a.activity_type === type && (!sentiment || a.reply_sentiment === sentiment)).map(a => a.opportunity_id)).size;
   const reviewed = rows.filter(r => r.first_decision !== null).length;
   const qualified = rows.filter(r => r.first_decision === 'QUALIFY').length;
+
+  const oppIds = new Set(rows.map(r => r.id));
+  const assigneeMap = new Map();
+  for (const row of rows) {
+    const key = row.assigned_to || '';
+    if (!assigneeMap.has(key)) assigneeMap.set(key, { assigned_to: key, candidates: 0, qualified: 0, contacted: 0, won: 0 });
+    const entry = assigneeMap.get(key);
+    entry.candidates++;
+    if (row.qualification_status === 'QUALIFIED') entry.qualified++;
+  }
+  const contactedSet = new Set(activities.filter(a => a.activity_type === 'EMAIL_SENT').map(a => a.opportunity_id));
+  const wonSet = new Set(activities.filter(a => a.activity_type === 'DEAL_WON').map(a => a.opportunity_id));
+  for (const row of rows) {
+    const entry = assigneeMap.get(row.assigned_to || '');
+    if (contactedSet.has(row.id)) entry.contacted++;
+    if (wonSet.has(row.id)) entry.won++;
+  }
+
+  const jobRows = db.prepare(`SELECT r.research_job_id, j.source_mode, j.created_at, COUNT(DISTINCT r.opportunity_id) AS candidates,
+    SUM(CASE WHEN o.qualification_status='QUALIFIED' THEN 1 ELSE 0 END) AS qualified
+    FROM research_job_results r
+    JOIN research_jobs j ON j.id=r.research_job_id AND j.organization_id=r.organization_id
+    JOIN opportunities o ON o.id=r.opportunity_id AND o.organization_id=r.organization_id
+    WHERE r.organization_id=? AND r.opportunity_id IS NOT NULL AND o.created_at>=? AND o.created_at<? AND o.created_at<=?
+    GROUP BY r.research_job_id, j.source_mode, j.created_at ORDER BY j.created_at DESC LIMIT 20`)
+    .all(orgId, start.toISOString(), endExclusive, asOf);
+  const rejectReasons = db.prepare(`SELECT reason, COUNT(*) AS count
+    FROM opportunity_history WHERE organization_id=? AND action='REJECT' AND created_at>=? AND created_at<? AND created_at<=?
+    GROUP BY reason ORDER BY count DESC LIMIT 10`).all(orgId, start.toISOString(), endExclusive, asOf);
+  const jobFailures = db.prepare(`SELECT step, COUNT(*) AS count
+    FROM research_job_failures WHERE organization_id=? AND created_at>=? AND created_at<? AND created_at<=?
+    GROUP BY step ORDER BY count DESC`).all(orgId, start.toISOString(), endExclusive, asOf);
+
   return {
-    filters: { from, to, as_of: asOf, timezone: 'UTC', assigned_to: 'LOCAL_OWNER', product_category: 'LAUNDRY_PODS', market: 'US' },
+    filters: { from, to, as_of: asOf, timezone: 'UTC', assigned_to: filterAssigned || 'ALL', product_category: filterCategory || 'ALL', market: filterMarket || 'ALL' },
     generated_at: generated.toISOString(),
     metrics: {
       candidates: rows.length, reviewed, qualified, qualification_rate: reviewed ? qualified / reviewed : null,
@@ -128,6 +209,13 @@ function funnel(db, query) {
       qualified: rows.filter(r => r.qualification_status === 'QUALIFIED').length,
       reassessment_required: rows.filter(r => r.qualification_status === 'REASSESSMENT_REQUIRED').length,
       pending: rows.filter(r => ['NEW', 'REVIEWING', 'NEEDS_EVIDENCE'].includes(r.qualification_status)).length,
+    },
+    breakdowns: {
+      by_assignee: [...assigneeMap.values()],
+      by_source_job: jobRows,
+      rejection_reasons: rejectReasons,
+      research_failure_steps: jobFailures,
+      matched_opportunity_count: oppIds.size,
     },
   };
 }

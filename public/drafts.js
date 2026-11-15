@@ -1,8 +1,35 @@
 const $ = selector => document.querySelector(selector);
 const labels = { DRAFT: '草稿', IN_REVIEW: '待审核', APPROVED: '已批准', REJECTED: '已拒绝', BLOCKED: '已阻断', SUPERSEDED: '已被新版本替代' };
-export function setupDrafts({ api, state, refresh, notify, escape, formHandler, date }) {
-  const displayValue = value => Array.isArray(value) ? value.join(' / ') : String(value ?? '未知');
+export function setupDrafts({ api, state, refresh, refreshScope = () => refresh(), notify, escape, formHandler, date }) {
+  const displayValue = value => Array.isArray(value)
+    ? value.map(v => (v && typeof v === 'object' ? `${v.product_category || ''}:${v.min_moq ?? '?'}-${v.max_moq ?? '?'} ${v.unit || ''}` : String(v))).join(' / ')
+    : String(value ?? '未知');
   const current = id => state.detail?.drafts.find(d => d.id === id);
+  function templateFor(key) {
+    const cat = state.detail?.product_category || state.workspace?.catalog?.enabled_scope?.product_categories?.[0] || 'LAUNDRY_PODS';
+    const catEn = state.workspace?.catalog?.product_categories?.[cat]?.english || 'OEM/ODM product';
+    const titleEn = catEn.replace(/\b\w/g, ch => ch.toUpperCase());
+    if (key === 'FIRST_TOUCH') {
+      return {
+        subject: `OEM/ODM ${titleEn} Manufacturing Inquiry`,
+        body: `Hello,\n\nWe reviewed your product lineup and would welcome a brief introduction to discuss private-label or custom ${catEn} manufacturing support.\n\nIf you are open to reviewing specs or MOQ options, please let me know who handles supplier onboarding.\n\nBest regards,`,
+      };
+    }
+    if (key === 'SAMPLE_FOLLOWUP') {
+      return {
+        subject: 'Sample & Packaging Specification Follow-up',
+        body: `Hello,\n\nFollowing up on our earlier note, we can prepare laboratory or pre-production samples for ${catEn} once target unit count, packaging format, and formula specifications are confirmed.\n\nWould you like us to share a sample checklist?\n\nBest regards,`,
+      };
+    }
+    if (key === 'MOQ_QUOTE') {
+      return {
+        subject: 'Production MOQ & Lead Time Overview',
+        body: 'Hello,\n\nBased on our current production lines, we can share indicative MOQ tiers and standard lead time estimates tailored to your packaging format.\n\nPlease let us know your preferred unit count per pack so we can prepare an accurate breakdown.\n\nBest regards,',
+      };
+    }
+    return null;
+  }
+  let lastDraftField = null;
   const clearError = form => { form.querySelector('.sn-form-error').hidden = true; form.querySelectorAll('[aria-invalid]').forEach(e => e.removeAttribute('aria-invalid')); };
   function referenceText(c) {
     return c.kind === 'EVIDENCE' ? `证据 ${c.evidence_id.slice(0, 8)} / 版本 ${c.evidence_version}${c.time_sensitive ? ' / 时效性陈述' : ''}` : `工厂版本 ${c.profile_version} / ${state.capabilities.fields[c.field]}：${displayValue(c.value)}`;
@@ -16,10 +43,11 @@ export function setupDrafts({ api, state, refresh, notify, escape, formHandler, 
       d.contacts.some(c => c.verification_status === 'VERIFIED' && !c.suppression_reason) &&
       d.evidence.some(e => e.verification_status === 'VERIFIED' && !e.purged_at) &&
       (state.checkOptions || []).length > 0;
-    return `<section class="sn-detail-section"><div class="sn-section-heading"><h3>英文开发信</h3><button class="sn-button sn-secondary" data-draft-new ${!d.contacts.some(c => !c.suppression_reason) || ['REJECTED','ARCHIVED'].includes(d.qualification_status) || ['WON','LOST'].includes(d.sales_stage) ? 'disabled' : ''}>撰写人工草稿</button><button class="sn-button sn-secondary" data-draft-generate ${canGenerate ? '' : 'disabled'}>AI 生成草稿</button></div><p class="sn-helper">模型生成内容仅作草稿；系统校验引用归属，仍需人工核对全文并审批。人工草稿与复制同样不等于发送。</p>${d.drafts.map(v => `<article class="sn-draft-entry"><div class="sn-section-heading"><h3>${escape(v.subject)}</h3><span class="sn-state">${labels[v.status]} · v${v.number}</span></div><p class="sn-helper">联系人：${escape(v.contact_snapshot?.full_name || d.contacts.find(c => c.id === v.contact_id)?.full_name || '已失效')} · ${v.created_by === 'AI' ? '模型生成（待人工核对）' : '人工撰写'}${v.contact_snapshot?.provenance === 'MIGRATED_CURRENT_RECORD' ? ' · 联系人快照来自升级时资料，非历史身份验证' : ' · 联系人为草稿录入时快照'}</p><p class="sn-draft-body">${escape(v.body)}</p>${v.warnings.length ? `<ul class="sn-draft-warnings">${v.warnings.map(w => `<li>${escape(w)}</li>`).join('')}</ul>` : ''}${claimMarkup(v.claims)}<div class="sn-actions"><button class="sn-button sn-secondary" data-draft-edit="${escape(v.id)}">编辑新版本</button><button class="sn-button sn-secondary" data-draft-review="${escape(v.id)}" ${v.status === 'APPROVED' ? 'disabled' : ''}>审核此版本</button><button class="sn-button sn-secondary" data-draft-copy="${escape(v.id)}" data-part="subject" ${v.status !== 'APPROVED' ? 'disabled' : ''}>复制已审核主题</button><button class="sn-button sn-secondary" data-draft-copy="${escape(v.id)}" data-part="body" ${v.status !== 'APPROVED' ? 'disabled' : ''}>复制已审核正文</button></div><details class="sn-history-details"><summary>版本与审核历史</summary>${v.versions.map(old => `<details><summary>版本 ${old.number} · ${labels[old.status]} · ${date(old.created_at)}</summary><p>${escape(old.subject)}</p><p class="sn-helper">${escape(old.contact_snapshot?.full_name || '未记录姓名')} / ${escape(old.contact_snapshot?.email || '未记录邮箱')} · ${old.contact_snapshot?.provenance === 'MIGRATED_CURRENT_RECORD' ? '升级时资料快照' : '草稿录入时快照'}</p><p class="sn-draft-body">${escape(old.body)}</p>${claimMarkup(old.claims)}</details>`).join('')}<ul>${v.reviews.map(r => `<li>${date(r.created_at)} · ${escape({ APPROVE: '人工批准', REJECT: '人工拒绝', APPROVAL_INVALIDATED: '批准失效', SUPERSEDED: '旧版本保留' }[r.action] || r.action)}<p>${escape(r.reason)}</p></li>`).join('')}</ul></details></article>`).join('') || '<p class="sn-muted">还没有草稿。先录入带来源的联系人，再撰写并关联事实依据。</p>'}</section>`;
+    return `<section class="sn-detail-section"><div class="sn-section-heading"><h3>英文开发信</h3><button class="sn-button sn-secondary" data-draft-new ${!d.contacts.some(c => !c.suppression_reason) || ['REJECTED','ARCHIVED'].includes(d.qualification_status) || ['WON','LOST'].includes(d.sales_stage) ? 'disabled' : ''}>撰写人工草稿</button><button class="sn-button sn-secondary" data-draft-generate ${canGenerate ? '' : 'disabled'}>AI 生成草稿</button></div><p class="sn-helper">模型生成内容仅作草稿；系统校验引用归属，仍需人工核对全文并审批。人工草稿与复制同样不等于发送。</p>${d.drafts.map(v => `<article class="sn-draft-entry"><div class="sn-section-heading"><h3>${escape(v.subject)}</h3><span class="sn-state">${labels[v.status]} · v${v.number}</span></div><p class="sn-helper">联系人：${escape(v.contact_snapshot?.full_name || d.contacts.find(c => c.id === v.contact_id)?.full_name || '已失效')} · ${v.created_by === 'AI' ? '模型生成（待人工核对）' : '人工撰写'}${v.contact_snapshot?.provenance === 'MIGRATED_CURRENT_RECORD' ? ' · 联系人快照来自升级时资料，非历史身份验证' : ' · 联系人为草稿录入时快照'}</p><p class="sn-draft-body">${escape(v.body)}</p>${v.warnings.length ? `<ul class="sn-draft-warnings">${v.warnings.map(w => `<li>${escape(w)}</li>`).join('')}</ul>` : ''}${claimMarkup(v.claims)}<div class="sn-actions"><button class="sn-button sn-secondary" data-draft-edit="${escape(v.id)}">编辑新版本</button><button class="sn-button sn-secondary" data-draft-review="${escape(v.id)}" ${!['DRAFT', 'IN_REVIEW'].includes(v.status) ? 'disabled' : ''}>审核此版本</button><button class="sn-button sn-secondary" data-draft-copy="${escape(v.id)}" data-part="subject" ${v.status !== 'APPROVED' ? 'disabled' : ''}>复制已审核主题</button><button class="sn-button sn-secondary" data-draft-copy="${escape(v.id)}" data-part="body" ${v.status !== 'APPROVED' ? 'disabled' : ''}>复制已审核正文</button></div><details class="sn-history-details"><summary>版本与审核历史</summary>${v.versions.map(old => `<details><summary>版本 ${old.number} · ${labels[old.status]} · ${date(old.created_at)}</summary><p>${escape(old.subject)}</p><p class="sn-helper">${escape(old.contact_snapshot?.full_name || '未记录姓名')} / ${escape(old.contact_snapshot?.email || '未记录邮箱')} · ${old.contact_snapshot?.provenance === 'MIGRATED_CURRENT_RECORD' ? '升级时资料快照' : '草稿录入时快照'}</p><p class="sn-draft-body">${escape(old.body)}</p>${claimMarkup(old.claims)}</details>`).join('')}<ul>${v.reviews.map(r => `<li>${date(r.created_at)} · ${escape({ APPROVE: '人工批准', REJECT: '人工拒绝', APPROVAL_INVALIDATED: '批准失效', SUPERSEDED: '旧版本保留' }[r.action] || r.action)}<p>${escape(r.reason)}</p></li>`).join('')}</ul></details></article>`).join('') || '<p class="sn-muted">还没有草稿。先录入带来源的联系人，再撰写并关联事实依据。</p>'}</section>`;
   }
   function renderCapabilities() {
-    $('#check-capability').disabled = state.workspace.factory.status !== 'ACTIVE' || state.factoryDirty;
+    const isOwner = state.workspace?.current_user?.role === 'OWNER';
+    $('#check-capability').disabled = !isOwner || state.workspace.factory.status !== 'ACTIVE' || state.factoryDirty;
     const items = state.capabilities.items || [];
     $('#capability-summary').innerHTML = `<p class="sn-helper">${items.length} / ${state.capabilityTotal ?? items.length} 条已核验字段记录（当前档案版本）</p>` +
       (items.length ? `<ul class="sn-history">${items.map(c => `<li>${escape(state.capabilities.fields[c.field])}：${escape(displayValue(c.value))} · 版本 ${c.profile_version}</li>`).join('')}</ul>` : '<p class="sn-helper">当前档案版本尚无字段核验。</p>') +
@@ -37,15 +65,27 @@ export function setupDrafts({ api, state, refresh, notify, escape, formHandler, 
   $('#capability-form').elements.field.addEventListener('change', updateCapabilityValue);
   formHandler('#capability-form', async form => {
     await api('/factory-profile/checks', 'POST', { field: form.elements.field.value, reason: form.elements.reason.value, confirmed: form.elements.confirmed.checked, expected_version: Number(form.dataset.version) });
-    await refresh(); $('#capability-dialog').close(); notify('该版本的能力字段已由本地负责人核验。修改工厂档案后需要重新核对。');
+    await refreshScope('factory', 'detail'); $('#capability-dialog').close(); notify('该版本的能力字段已由本地负责人核验。修改工厂档案后需要重新核对。');
   });
-  function sourceOptions() {
-    return '<option value="">请选择支持依据</option>' + state.detail.evidence.map(e => `<option value="e:${escape(e.id)}">证据 ${escape(e.id.slice(0,8))} · ${e.verification_status === 'VERIFIED' ? '已核验' : '未核验/失效'} · ${escape(e.raw_text.slice(0,55))}</option>`).join('') + state.checkOptions.map(c => `<option value="f:${escape(c.id)}">工厂字段 ${escape(state.capabilities.fields[c.field])} · ${escape(displayValue(c.value))}</option>`).join('');
+  function sourceOptions(claims = []) {
+    const knownChecks = new Set(state.checkOptions.map(c => c.id));
+    const legacyChecks = (Array.isArray(claims) ? claims : [])
+      .filter(c => c && c.kind === 'FACTORY' && c.check_id && !knownChecks.has(c.check_id))
+      .reduce((acc, c) => {
+        if (!acc.some(item => item.check_id === c.check_id)) acc.push(c);
+        return acc;
+      }, []);
+    return '<option value="">请选择支持依据</option>' +
+      state.detail.evidence.map(e => `<option value="e:${escape(e.id)}">证据 ${escape(e.id.slice(0,8))} · ${e.verification_status === 'VERIFIED' ? '已核验' : '未核验/失效'} · ${escape(e.raw_text.slice(0,55))}</option>`).join('') +
+      state.checkOptions.map(c => `<option value="f:${escape(c.id)}">工厂字段 ${escape(state.capabilities.fields[c.field] || c.field)} · ${escape(displayValue(c.value))}</option>`).join('') +
+      legacyChecks.map(c => `<option value="f:${escape(c.check_id)}">工厂字段（旧版本 v${escape(c.profile_version ?? '?')} · 需重核）${escape(state.capabilities.fields[c.field] || c.field)} · ${escape(displayValue(c.value))}</option>`).join('');
   }
-  function addClaim(claim) {
+  let claimFieldSeq = 0;
+  function addClaim(claim, existingClaims = []) {
     if ($('#draft-claim-rows').children.length >= 30) { notify('最多填写 30 条事实陈述。'); return; }
+    const seq = ++claimFieldSeq;
     const row = document.createElement('fieldset'); row.className = 'sn-claim-row';
-    row.innerHTML = `<legend>事实陈述</legend><label class="sn-field">主题或正文中的事实原句<textarea data-claim-text rows="2" maxlength="2000" required></textarea></label><label class="sn-field">支持依据<select data-claim-source required>${sourceOptions()}</select></label><label class="sn-field" data-quote-label>证据中的原文片段<textarea data-claim-quote rows="2" maxlength="5000"></textarea><span class="sn-helper">须与保存的原文一致；请从下方来源摘录。</span></label><div data-source-preview class="sn-helper sn-source-preview"></div><label class="sn-check" data-time-label><input data-claim-time type="checkbox">这是“当前在售”等时效性陈述，引用需在 7 天内核验。</label><button class="sn-button sn-secondary" type="button" data-claim-remove>移除此条陈述</button>`;
+    row.innerHTML = `<legend>事实陈述</legend><label class="sn-field">主题或正文中的事实原句<textarea id="claim-${seq}-text" data-claim-text rows="2" maxlength="2000" required></textarea></label><label class="sn-field">支持依据<select id="claim-${seq}-source" data-claim-source required>${sourceOptions(existingClaims)}</select></label><label class="sn-field" data-quote-label>证据中的原文片段<textarea id="claim-${seq}-quote" data-claim-quote rows="2" maxlength="5000"></textarea><span class="sn-helper">须与保存的原文一致；请从下方来源摘录。</span></label><div data-source-preview class="sn-helper sn-source-preview"></div><label class="sn-check" data-time-label><input id="claim-${seq}-time" data-claim-time type="checkbox">这是“当前在售”等时效性陈述，引用需在 7 天内核验。</label><button class="sn-button sn-secondary" type="button" data-claim-remove>移除此条陈述</button>`;
     row.querySelector('[data-claim-text]').value = claim?.text || '';
     row.querySelector('[data-claim-quote]').value = claim?.quote || '';
     row.querySelector('[data-claim-time]').checked = claim?.time_sensitive || false;
@@ -63,6 +103,39 @@ export function setupDrafts({ api, state, refresh, notify, escape, formHandler, 
     const source = isEvidence ? state.detail.evidence.find(e => e.id === id)?.raw_text : state.checkOptions.find(c => c.id === id)?.reason;
     row.querySelector('[data-source-preview]').textContent = source || '请先选择依据。旧工厂字段核验不在当前版本中时，需重新核验后选择。';
   }
+  function updateWordCount() {
+    const form = $('#draft-editor-form');
+    const text = `${form.elements.subject.value || ''} ${form.elements.body.value || ''}`.trim();
+    const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
+    $('#draft-word-count').textContent = `${words} 词 · ${text.length} 字符`;
+  }
+  $('#draft-editor-form').elements.subject.addEventListener('input', updateWordCount);
+  $('#draft-editor-form').elements.body.addEventListener('input', updateWordCount);
+  $('#draft-editor-form').elements.subject.addEventListener('focus', event => { lastDraftField = event.currentTarget; });
+  $('#draft-editor-form').elements.body.addEventListener('focus', event => { lastDraftField = event.currentTarget; });
+  $('#draft-template-select').addEventListener('change', event => {
+    const tpl = templateFor(event.currentTarget.value);
+    if (!tpl) return;
+    const form = $('#draft-editor-form');
+    if ((form.elements.subject.value || form.elements.body.value) && !window.confirm('应用模板将替换当前主题与正文，是否继续？')) {
+      event.currentTarget.value = '';
+      return;
+    }
+    form.elements.subject.value = tpl.subject;
+    form.elements.body.value = tpl.body;
+    updateWordCount();
+  });
+  $('#draft-quote-selection').addEventListener('click', () => {
+    const form = $('#draft-editor-form');
+    const field = lastDraftField || form.elements.body;
+    const start = field.selectionStart ?? 0, end = field.selectionEnd ?? 0;
+    const selected = field.value.slice(start, end).trim();
+    if (!selected) {
+      notify('请先在“英文主题”或“英文正文”中划选一句事实文本，再点击“选区引用为事实”。');
+      return;
+    }
+    addClaim({ text: selected, kind: 'EVIDENCE', quote: '' });
+  });
   $('#add-draft-claim').addEventListener('click', () => addClaim());
   function openEditor(id) {
     if (!state.detail) return;
@@ -71,8 +144,10 @@ export function setupDrafts({ api, state, refresh, notify, escape, formHandler, 
     form.elements.contact_id.innerHTML = '<option value="">请选择联系人</option>' + state.detail.contacts.filter(c => !c.suppression_reason).map(c => `<option value="${escape(c.id)}">${escape(c.full_name)} · ${escape(c.email)}</option>`).join('');
     form.elements.contact_id.value = draft?.contact_id || '';
     form.elements.subject.value = draft?.subject || ''; form.elements.body.value = draft?.body || '';
+    $('#draft-template-select').value = '';
+    updateWordCount();
     $('#draft-claim-rows').replaceChildren();
-    for (const claim of draft?.claims || []) addClaim(claim);
+    for (const claim of draft?.claims || []) addClaim(claim, draft?.claims || []);
     $('#draft-editor-dialog').showModal();
   }
   formHandler('#draft-editor-form', async form => {
@@ -82,7 +157,7 @@ export function setupDrafts({ api, state, refresh, notify, escape, formHandler, 
     });
     const data = { ...Object.fromEntries(new FormData(form)), claims, expected_version: Number(form.dataset.version) };
     await api(form.dataset.id ? `/drafts/${form.dataset.id}` : `/opportunities/${form.dataset.opportunity}/drafts`, form.dataset.id ? 'PATCH' : 'POST', data);
-    await refresh(); $('#draft-editor-dialog').close(); notify('人工草稿已保存为新版本，旧批准不会继承。');
+    await refreshScope('detail', 'opportunities'); $('#draft-editor-dialog').close(); notify('人工草稿已保存为新版本，旧批准不会继承。');
   });
   function approvalChecks() {
     const approve = $('#draft-review-form').elements.action.value === 'APPROVE';
@@ -99,7 +174,7 @@ export function setupDrafts({ api, state, refresh, notify, escape, formHandler, 
   }
   formHandler('#draft-review-form', async form => {
     await api(`/drafts/${form.dataset.id}/review`, 'POST', { expected_version: Number(form.dataset.version), draft_version_id: form.dataset.versionId, action: form.elements.action.value, reason: form.elements.reason.value, full_text_confirmed: form.elements.full_text_confirmed.checked, claims_confirmed: form.elements.claims_confirmed.checked });
-    await refresh(); $('#draft-review-dialog').close(); notify('已保存此版本的人工审核记录。复制仍需再次校验当前依赖。');
+    await refreshScope('detail', 'opportunities'); $('#draft-review-dialog').close(); notify('已保存此版本的人工审核记录。复制仍需再次校验当前依赖。');
   });
   async function copyDraft(button) {
     const draft = current(button.dataset.draftCopy); if (!draft) return;
@@ -109,7 +184,7 @@ export function setupDrafts({ api, state, refresh, notify, escape, formHandler, 
       await navigator.clipboard.writeText(result.content);
       notify(`已复制审核通过的${result.part === 'subject' ? '主题' : '正文'}（版本 ${draft.number}）。尚未记录发送。`);
     } catch (error) { notify(`复制未完成：${error.message}。请刷新核对状态；不会记录为已发送。`); }
-    finally { await refresh().catch(error => notify(error.message)); }
+    finally { await refreshScope('detail').catch(error => notify(error.message)); }
   }
   async function generateDraft(button) {
     const id = state.detail?.id;
@@ -119,7 +194,7 @@ export function setupDrafts({ api, state, refresh, notify, escape, formHandler, 
     notify('正在生成 AI 草稿，可能需要几十秒…');
     try {
       await api(`/opportunities/${encodeURIComponent(id)}/drafts/generate`, 'POST', {});
-      await refresh();
+      await refreshScope('detail', 'opportunities', 'ai_runs');
       notify('AI 草稿已生成。请逐条核对引用、编辑并人工审批；未批准不能复制。');
     } catch (error) { notify(error.message); }
     finally { button.disabled = false; button.textContent = label; }

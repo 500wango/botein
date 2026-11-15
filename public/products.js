@@ -1,8 +1,18 @@
 const $ = selector => document.querySelector(selector);
-const categoryLabels = { LAUNDRY_PODS: '洗衣凝珠', DISHWASHER_TABLETS: '洗碗块 · 范围外', OTHER: '其他品类 · 范围外', UNKNOWN: '品类待确认' };
-export function setupProducts({ api, state, refresh, notify, escape, formHandler, date }) {
+const defaultCategoryLabels = { LAUNDRY_PODS: '洗衣凝珠', DISHWASHER_TABLETS: '洗碗块', SCENT_BOOSTERS: '留香珠', OTHER: '其他品类', UNKNOWN: '品类待确认' };
+export function setupProducts({ api, state, refresh, refreshScope = () => refresh(), notify, escape, formHandler, date }) {
   let accountId = '', products = [], productTotal = 0, productCursor = null, request = 0, selectorRequest = 0;
   const clearError = form => { form.querySelector('.sn-form-error').hidden = true; form.querySelectorAll('[aria-invalid]').forEach(e => e.removeAttribute('aria-invalid')); };
+  function categoryLabel(code) {
+    const enabled = state.workspace?.catalog?.enabled_scope?.product_categories || ['LAUNDRY_PODS'];
+    const name = state.workspace?.catalog?.product_categories?.[code]?.label || defaultCategoryLabels[code] || code || '待确认品类';
+    if (code === 'UNKNOWN' || code === 'OTHER') return name;
+    return enabled.includes(code) ? name : `${name}（当前范围外）`;
+  }
+  function categorySelectOptions() {
+    const entries = Object.entries(state.workspace?.catalog?.product_categories || { LAUNDRY_PODS: { label: '洗衣凝珠' }, DISHWASHER_TABLETS: { label: '洗碗块' }, SCENT_BOOSTERS: { label: '留香珠' } });
+    return entries.map(([code, meta]) => `<option value="${escape(code)}">${escape(categoryLabel(code))}</option>`).join('') + '<option value="OTHER">其他品类</option><option value="UNKNOWN">待确认品类</option>';
+  }
   function productSnapshot(details) {
     const fields = { product_name: '名称', product_category: '品类', product_url: '原始链接', external_sku: 'SKU', marketplace: '平台', packaging_type: '包装', notes: '备注', status: '资料状态' };
     const show = value => value == null || value === '' ? '未填写' : String(value);
@@ -10,10 +20,10 @@ export function setupProducts({ api, state, refresh, notify, escape, formHandler
     return `<dl class="sn-product-changes">${Object.entries(fields).filter(([key]) => !details.changed || details.changed.includes(key)).map(([key,label]) => `<dt>${label}</dt><dd>${details.before ? `${escape(show(details.before[key]))} → ` : ''}${escape(show(row[key]))}</dd>`).join('')}</dl>`;
   }
   function evidenceLabel(e) {
-    return `<p class="sn-helper">${e.product_id ? `关联产品：${escape(e.product_name || '产品资料暂不可用')} · ${escape(categoryLabels[e.product_category] || '待确认')}${e.product_status === 'ARCHIVED' ? ' · 已归档' : ''} · 关联时的产品版本 ${e.product_version ?? '未知'}` : '品牌层级证据 · 具体产品 / SKU 未确认'}</p>`;
+    return `<p class="sn-helper">${e.product_id ? `关联产品：${escape(e.product_name || '产品资料暂不可用')} · ${escape(categoryLabel(e.product_category))}${e.product_status === 'ARCHIVED' ? ' · 已归档' : ''} · 关联时的产品版本 ${e.product_version ?? '未知'}` : '品牌层级证据 · 具体产品 / SKU 未确认'}</p>`;
   }
   function options(items) {
-    return '<option value="">品牌层级，具体产品未确认</option>' + items.filter(p => p.status === 'ACTIVE').map(p => `<option value="${escape(p.id)}">${escape(p.product_name)} · ${categoryLabels[p.product_category]}${p.external_sku ? ` · ${escape(p.external_sku)}` : ''}</option>`).join('');
+    return '<option value="">品牌层级，具体产品未确认</option>' + items.filter(p => p.status === 'ACTIVE').map(p => `<option value="${escape(p.id)}">${escape(p.product_name)} · ${escape(categoryLabel(p.product_category))}${p.external_sku ? ` · ${escape(p.external_sku)}` : ''}</option>`).join('');
   }
   async function openProducts(id) {
     accountId = id; request++; products = []; productCursor = null;
@@ -24,7 +34,7 @@ export function setupProducts({ api, state, refresh, notify, escape, formHandler
   }
   function renderProducts() {
     $('#products-list').innerHTML = `<p class="sn-helper">${products.length} / ${productTotal} 个产品</p>` +
-      (products.length ? products.map(p => `<article class="sn-product-entry"><div class="sn-section-heading"><h3>${escape(p.product_name)}</h3><span class="sn-state">${p.status === 'ARCHIVED' ? '已归档' : '资料已录入'} · v${p.version}</span></div><p>${categoryLabels[p.product_category]}</p><p class="sn-helper">SKU：${escape(p.external_sku || '未知')} · 平台：${escape(p.marketplace || '未填写')}<br>包装：${escape(p.packaging_type || '未知')} · 关联证据 ${p.evidence_count} 条</p><a href="${escape(p.product_url)}" target="_blank" rel="noopener noreferrer">${escape(p.product_url)}</a>${p.notes ? `<p>${escape(p.notes)}</p>` : ''}<div class="sn-actions"><button class="sn-button sn-secondary" data-product-edit="${escape(p.id)}">编辑 / 归档</button><button class="sn-button sn-secondary" data-product-history="${escape(p.id)}">查看变更记录</button></div><div id="product-history-${escape(p.id)}"></div></article>`).join('') : '<div class="sn-empty"><h3>还没有产品资料</h3><p>记录品牌已公开的产品链接、品类和平台编号，未知参数可以留空。</p></div>') +
+      (products.length ? products.map(p => `<article class="sn-product-entry"><div class="sn-section-heading"><h3>${escape(p.product_name)}</h3><span class="sn-state">${p.status === 'ARCHIVED' ? '已归档' : '资料已录入'} · v${p.version}</span></div><p>${escape(categoryLabel(p.product_category))}</p><p class="sn-helper">SKU：${escape(p.external_sku || '未知')} · 平台：${escape(p.marketplace || '未填写')}<br>包装：${escape(p.packaging_type || '未知')} · 关联证据 ${p.evidence_count} 条</p><a href="${escape(p.product_url)}" target="_blank" rel="noopener noreferrer">${escape(p.product_url)}</a>${p.notes ? `<p>${escape(p.notes)}</p>` : ''}<div class="sn-actions"><button class="sn-button sn-secondary" data-product-edit="${escape(p.id)}">编辑 / 归档</button><button class="sn-button sn-secondary" data-product-history="${escape(p.id)}">查看变更记录</button></div><div id="product-history-${escape(p.id)}"></div></article>`).join('') : '<div class="sn-empty"><h3>还没有产品资料</h3><p>记录品牌已公开的产品链接、品类和平台编号，未知参数可以留空。</p></div>') +
       (productCursor ? '<div class="sn-actions"><button class="sn-button sn-secondary" type="button" data-products-more>加载更多产品</button></div>' : '');
   }
   async function loadProducts(reset = true) {
@@ -45,9 +55,10 @@ export function setupProducts({ api, state, refresh, notify, escape, formHandler
     const p = id ? products.find(p => p.id === id) : null;
     if (id && !p) return;
     const form = $('#product-editor-form'); form.reset(); clearError(form);
+    form.elements.product_category.innerHTML = categorySelectOptions();
     form.dataset.accountId = accountId; form.dataset.id = p?.id || ''; form.dataset.version = p?.version || '';
     for (const name of ['product_name', 'product_category', 'product_url', 'external_sku', 'marketplace', 'packaging_type', 'notes', 'status']) {
-      form.elements[name].value = p?.[name] ?? (name === 'product_category' ? 'LAUNDRY_PODS' : name === 'status' ? 'ACTIVE' : '');
+      form.elements[name].value = p?.[name] ?? (name === 'product_category' ? (state.workspace?.catalog?.enabled_scope?.product_categories?.[0] || 'LAUNDRY_PODS') : name === 'status' ? 'ACTIVE' : '');
     }
     form.elements.reason.required = !!p; $('#product-change-reason').hidden = !p;
     $('#product-editor-title').textContent = p ? '编辑品牌产品' : '新增品牌产品';
@@ -57,7 +68,7 @@ export function setupProducts({ api, state, refresh, notify, escape, formHandler
   formHandler('#product-editor-form', async form => {
     const body = Object.fromEntries(new FormData(form)); body.expected_version = Number(form.dataset.version);
     const result = await api(`/accounts/${form.dataset.accountId}/products${form.dataset.id ? `/${form.dataset.id}` : ''}`, form.dataset.id ? 'PATCH' : 'POST', body);
-    await refresh(); $('#product-editor-dialog').close(); await openProducts(form.dataset.accountId);
+    await refreshScope('accounts', 'evidence', 'detail'); $('#product-editor-dialog').close(); await openProducts(form.dataset.accountId);
     notify(result.reused ? '产品已存在，已复用原记录。' : result.unchanged ? '产品资料未变化。' : '产品已保存；核心资料变化会同步要求关联证据重新核验。');
   });
   async function showHistory(button) {
@@ -84,7 +95,8 @@ export function setupProducts({ api, state, refresh, notify, escape, formHandler
   }
   $('#evidence-form').elements.account_id.addEventListener('change', populateEvidenceProducts);
   async function linkEvidence(id) {
-    const e = state.evidence.find(e => e.id === id); if (!e) return;
+    const e = state.evidence.find(item => item.id === id) || state.detail?.evidence?.find(item => item.id === id);
+    if (!e) return;
     const form = $('#evidence-product-form'); form.reset(); clearError(form);
     form.dataset.id = e.id; form.dataset.version = e.version;
     const selected = form.elements.product_id, submit = form.querySelector('[type="submit"]');
@@ -102,7 +114,7 @@ export function setupProducts({ api, state, refresh, notify, escape, formHandler
   }
   formHandler('#evidence-product-form', async form => {
     await api(`/evidence/${form.dataset.id}/product`, 'PATCH', { expected_version: Number(form.dataset.version), product_id: form.elements.product_id.value || null, reason: form.elements.reason.value });
-    await refresh(); $('#evidence-product-dialog').close(); notify('产品归属已保存；发生变更的证据需重新核验，原文与审核历史保留。');
+    await refreshScope('evidence', 'detail'); $('#evidence-product-dialog').close(); notify('产品归属已保存；发生变更的证据需重新核验，原文与审核历史保留。');
   });
   document.addEventListener('click', event => {
     const manage = event.target.closest('[data-products-account]'); if (manage) openProducts(manage.dataset.productsAccount);
