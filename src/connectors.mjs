@@ -1,7 +1,22 @@
 import { randomUUID } from 'node:crypto';
 import { sealSecret, unsealSecret } from './kms.mjs';
+import { connectorUrl, safeExternalFetch } from './source-fetch.mjs';
 import { audit, requestContext, transaction } from './store.mjs';
 import { AppError, publicUrl, requireValue, text } from './validation.mjs';
+
+const SENSITIVE_PAYLOAD_KEYS = new Set(['reset_token', 'invite_token', 'token', 'secret', 'password', 'api_key']);
+
+export function redactSensitivePayload(value) {
+  if (Array.isArray(value)) return value.map(redactSensitivePayload);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = SENSITIVE_PAYLOAD_KEYS.has(k) && v ? '[REDACTED]' : redactSensitivePayload(v);
+    }
+    return out;
+  }
+  return value;
+}
 
 export const CONNECTOR_KINDS = ['B2B_CONTACTS', 'ECOMMERCE_DATA', 'OUTBOUND_NOTIFY'];
 const CANONICAL_ROLES = new Set(['DECISION_MAKER', 'PROCUREMENT', 'OPERATIONS', 'SALES', 'GENERAL', 'UNKNOWN']);
@@ -84,7 +99,11 @@ export function saveConnectorConfig(db, kind, body, ctx = null) {
   requireValue(CONNECTOR_KINDS.includes(kind), '不支持的连接器类型。', 'kind');
   const { orgId } = requestContext(ctx);
   const enabled = body.enabled === true;
-  const endpointUrl = body.endpoint_url ? publicUrl(body.endpoint_url, 'endpoint_url', true) : '';
+  const allowPrivate = process.env.ALLOW_PRIVATE_CONNECTORS === '1';
+  const endpointUrl = body.endpoint_url
+    ? (allowPrivate ? connectorUrl(body.endpoint_url, { allowPrivate: true, field: 'endpoint_url' }).href : publicUrl(body.endpoint_url, 'endpoint_url', true))
+    : '';
+  if (endpointUrl) connectorUrl(endpointUrl, { allowPrivate, field: 'endpoint_url' });
   if (enabled) requireValue(endpointUrl, '启用外部连接器时必须提供有效的 HTTPS 接口地址。', 'endpoint_url');
   const options = body.options && typeof body.options === 'object' && !Array.isArray(body.options) ? body.options : {};
   return transaction(db, () => {
@@ -117,9 +136,10 @@ export function saveConnectorConfig(db, kind, body, ctx = null) {
  * Queries an optional configured B2B contact enrichment connector API.
  * Strictly returns candidate unverified contacts with source_url attribution.
  */
-export async function queryExternalContactsConnector(db, account, { signal, fetchImpl = fetch } = {}, ctx = null) {
+export async function queryExternalContactsConnector(db, account, { signal, fetchImpl = safeExternalFetch } = {}, ctx = null) {
   const cfg = getConnectorConfig(db, 'B2B_CONTACTS', ctx);
   if (!cfg.enabled || !cfg.endpoint_url) return [];
+  connectorUrl(cfg.endpoint_url, { field: 'endpoint_url' });
   const headers = { 'Content-Type': 'application/json' };
   if (cfg.api_key) headers.Authorization = `Bearer ${cfg.api_key}`;
   const response = await fetchImpl(cfg.endpoint_url, {
@@ -150,7 +170,7 @@ export async function queryExternalContactsConnector(db, account, { signal, fetc
     }));
 }
 
-export async function dispatchNotification(db, { channel, recipient, subject, payload }, ctx = null) {
+export async function dispatchNotification(db, { channel, recipient, subject, payload }, ctx = null, { fetchImpl = safeExternalFetch } = {}) {
   const { orgId } = requestContext(ctx);
   const cfg = getConnectorConfig(db, 'OUTBOUND_NOTIFY', ctx);
   const id = randomUUID(), now = new Date().toISOString();
@@ -158,9 +178,10 @@ export async function dispatchNotification(db, { channel, recipient, subject, pa
   let errorMessage = '';
   if (cfg.enabled && cfg.endpoint_url) {
     try {
+      connectorUrl(cfg.endpoint_url, { field: 'endpoint_url' });
       const headers = { 'Content-Type': 'application/json' };
       if (cfg.api_key) headers.Authorization = `Bearer ${cfg.api_key}`;
-      const res = await fetch(cfg.endpoint_url, {
+      const res = await fetchImpl(cfg.endpoint_url, {
         method: 'POST',
         headers,
         signal: timeoutSignal(null, 10_000),
@@ -173,10 +194,11 @@ export async function dispatchNotification(db, { channel, recipient, subject, pa
       errorMessage = error.message;
     }
   }
+  const redactedPayload = redactSensitivePayload(payload);
   db.prepare(`INSERT INTO outbound_notifications
     (id,organization_id,channel,recipient,subject,payload,status,error_message,created_at)
     VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(id, orgId, channel, recipient, subject, JSON.stringify(payload), status, errorMessage, now);
+    .run(id, orgId, channel, recipient, subject, JSON.stringify(redactedPayload), status, errorMessage, now);
   return { id, status, error_message: errorMessage, created_at: now };
 }
 
@@ -184,9 +206,10 @@ export async function dispatchNotification(db, { channel, recipient, subject, pa
  * Queries an optional configured e-commerce marketplace/listing data connector.
  * Returns normalized candidate records with unverified raw_text and source_url.
  */
-export async function queryEcommerceDataConnector(db, { market = 'US', product_category = 'LAUNDRY_PODS', quantity = 10 } = {}, { signal, fetchImpl = fetch } = {}, ctx = null) {
+export async function queryEcommerceDataConnector(db, { market = 'US', product_category = 'LAUNDRY_PODS', quantity = 10 } = {}, { signal, fetchImpl = safeExternalFetch } = {}, ctx = null) {
   const cfg = getConnectorConfig(db, 'ECOMMERCE_DATA', ctx);
   if (!cfg.enabled || !cfg.endpoint_url) return [];
+  connectorUrl(cfg.endpoint_url, { field: 'endpoint_url' });
   const headers = { 'Content-Type': 'application/json' };
   if (cfg.api_key) headers.Authorization = `Bearer ${cfg.api_key}`;
   const response = await fetchImpl(cfg.endpoint_url, {

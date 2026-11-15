@@ -58,7 +58,7 @@ function history(db, id, action, reason, details = {}, ctx = null) {
 }
 
 export function refreshAccountOpportunitiesFit(db, accountId, orgId = ORG) {
-  const opps = db.prepare('SELECT id, account_id, product_category FROM opportunities WHERE organization_id=? AND account_id=?').all(orgId, accountId);
+  const opps = db.prepare('SELECT id, account_id, product_category, estimated_order_quantity FROM opportunities WHERE organization_id=? AND account_id=?').all(orgId, accountId);
   const now = new Date().toISOString();
   for (const opp of opps) {
     const fit = evaluateOpportunityFit(db, opp, orgId);
@@ -136,17 +136,27 @@ export function salesApi(db, path, method, body, query, ctx = null) {
       requireValue(!row.purged_at, '原文已按保留政策清除，不能重新核验或标记失效。', undefined, 409, 'INVALID_TRANSITION');
       if (action === 'verify') {
         requireValue(row.source_url, '请重新录入带来源的证据后核验，原文记录不会被改写。', 'reason');
+        let verifiedProductVersion = row.product_version;
         if (row.product_id) {
           const product = db.prepare('SELECT * FROM account_products WHERE id=? AND account_id=? AND organization_id=?').get(row.product_id, row.account_id, orgId);
           requireValue(product?.status === 'ACTIVE', '关联产品已归档，请先修订归属或恢复产品。');
           db.prepare('UPDATE evidence SET product_version=? WHERE id=? AND organization_id=?').run(product.version, id, orgId);
+          verifiedProductVersion = product.version;
         }
         requireValue(body.confirmed === true, '请确认已打开来源并核对原文和品牌归属。', 'confirmed');
         requireValue(row.verification_status !== 'INVALIDATED', '被证伪的证据保留历史，请录入正确证据。', undefined, 409, 'INVALID_TRANSITION');
+        db.prepare('UPDATE evidence SET verification_status=?, version=version+1, checked_at=?, verification_note=? WHERE id=? AND organization_id=?')
+          .run('VERIFIED', new Date().toISOString(), reason, id, orgId);
+        // Refreshing checked_at on an already-verified non-expired record with unchanged product keeps active qualification refs in sync.
+        if (row.verification_status === 'VERIFIED' && row.availability_status !== 'EXPIRED' && (!row.product_id || verifiedProductVersion === row.product_version)) {
+          db.prepare('UPDATE opportunity_evidence SET evidence_version=? WHERE organization_id=? AND evidence_id=? AND evidence_version=?')
+            .run(row.version + 1, orgId, id, row.version);
+        }
+      } else {
+        db.prepare('UPDATE evidence SET verification_status=?, version=version+1, checked_at=?, verification_note=? WHERE id=? AND organization_id=?')
+          .run('INVALIDATED', new Date().toISOString(), reason, id, orgId);
+        reassessQualified(db, `引用证据失效：${reason}`, id, ctx);
       }
-      db.prepare('UPDATE evidence SET verification_status=?, version=version+1, checked_at=?, verification_note=? WHERE id=? AND organization_id=?')
-        .run(action === 'verify' ? 'VERIFIED' : 'INVALIDATED', new Date().toISOString(), reason, id, orgId);
-      if (action === 'invalidate') reassessQualified(db, `引用证据失效：${reason}`, id, ctx);
       refreshAccountOpportunitiesFit(db, row.account_id, orgId);
       audit(db, action === 'verify' ? 'EVIDENCE_VERIFIED_MANUALLY' : 'EVIDENCE_INVALIDATED', id, { reason, previous_status: row.verification_status, previous_version: row.version }, ctx);
       reconcileApprovals(db, { accountId: row.account_id }, ctx);
@@ -238,28 +248,61 @@ export function salesApi(db, path, method, body, query, ctx = null) {
     const accountId = text(body.account_id, 'account_id', 100), reason = text(body.reason, 'reason', 2000);
     const productCategory = body.product_category ? text(body.product_category, 'product_category', 40) : scope.product_categories[0];
     requireValue(scope.product_categories.includes(productCategory), '所选品类尚未开通。', 'product_category');
+    const estQty = body.estimated_order_quantity === undefined || body.estimated_order_quantity === null || body.estimated_order_quantity === ''
+      ? null
+      : Number(body.estimated_order_quantity);
+    requireValue(estQty === null || (Number.isSafeInteger(estQty) && estQty > 0), '预估采购量必须为正整数。', 'estimated_order_quantity');
     return transaction(db, () => {
       requireValue(db.prepare('SELECT id FROM accounts WHERE id=? AND organization_id=?').get(accountId, orgId), '品牌不存在。', 'account_id', 404, 'NOT_FOUND');
       const existing = db.prepare('SELECT id FROM opportunities WHERE account_id=? AND organization_id=? AND product_category=?').get(accountId, orgId, productCategory);
       if (existing) return { status: 200, body: { ...opportunity(db, existing.id, orgId), reused: true } };
       const assignedTo = resolveAssignee(db, orgId, body.assigned_to, '');
       const id = randomUUID(), now = new Date().toISOString();
-      const fit = evaluateOpportunityFit(db, { account_id: accountId, product_category: productCategory }, orgId);
+      const fit = evaluateOpportunityFit(db, { account_id: accountId, product_category: productCategory, estimated_order_quantity: estQty }, orgId);
       db.prepare(`INSERT INTO opportunities
-        (id,organization_id,account_id,product_category,fit_status,fit_checks,assigned_to,reason,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)`)
-        .run(id, orgId, accountId, productCategory, fit.fit_status, JSON.stringify(fit.fit_checks), assignedTo, reason, now, now);
+        (id,organization_id,account_id,product_category,fit_status,fit_checks,assigned_to,cohort_assignee,estimated_order_quantity,reason,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(id, orgId, accountId, productCategory, fit.fit_status, JSON.stringify(fit.fit_checks), assignedTo, assignedTo, estQty, reason, now, now);
       history(db, id, 'CREATED_MANUALLY', reason, {}, ctx);
       return { status: 201, body: opportunity(db, id, orgId) };
     });
   }
   if ((match = path.match(/^\/opportunities\/([^/]+)$/)) && method === 'GET') return { status: 200, body: detail(db, match[1], orgId) };
+  if ((match = path.match(/^\/opportunities\/([^/]+)\/fit$/)) && method === 'PATCH') {
+    return transaction(db, () => {
+      const item = opportunity(db, match[1], orgId); version(item, body);
+      const estQty = body.estimated_order_quantity === undefined
+        ? item.estimated_order_quantity
+        : (body.estimated_order_quantity === null || body.estimated_order_quantity === '' ? null : Number(body.estimated_order_quantity));
+      requireValue(estQty === null || (Number.isSafeInteger(estQty) && estQty > 0), '预估采购量必须为正整数。', 'estimated_order_quantity');
+      const fit = evaluateOpportunityFit(db, { ...item, estimated_order_quantity: estQty }, orgId);
+      db.prepare('UPDATE opportunities SET estimated_order_quantity=?, fit_status=?, fit_checks=?, version=version+1, updated_at=? WHERE id=? AND organization_id=?')
+        .run(estQty, fit.fit_status, JSON.stringify(fit.fit_checks), new Date().toISOString(), item.id, orgId);
+      history(db, item.id, 'FIT_REASSESSED', body.reason ? text(body.reason, 'reason', 500) : '更新需求数量并重估工厂适配状态', {
+        estimated_order_quantity: estQty, fit_status: fit.fit_status,
+      }, ctx);
+      return { status: 200, body: opportunity(db, item.id, orgId) };
+    });
+  }
+  if ((match = path.match(/^\/opportunities\/([^/]+)\/evaluate-fit$/)) && method === 'POST') {
+    return transaction(db, () => {
+      const item = opportunity(db, match[1], orgId);
+      const fit = evaluateOpportunityFit(db, item, orgId);
+      db.prepare('UPDATE opportunities SET fit_status=?, fit_checks=?, updated_at=? WHERE id=? AND organization_id=?')
+        .run(fit.fit_status, JSON.stringify(fit.fit_checks), new Date().toISOString(), item.id, orgId);
+      return { status: 200, body: opportunity(db, item.id, orgId) };
+    });
+  }
   if ((match = path.match(/^\/opportunities\/([^/]+)\/assign$/)) && method === 'PATCH') {
     return transaction(db, () => {
       const item = opportunity(db, match[1], orgId); version(item, body);
       const assignee = resolveAssignee(db, orgId, body.assigned_to, '');
-      db.prepare('UPDATE opportunities SET assigned_to=?, version=version+1, updated_at=? WHERE id=? AND organization_id=?')
-        .run(assignee, new Date().toISOString(), item.id, orgId);
+      const hasDecision = db.prepare("SELECT 1 FROM opportunity_history WHERE organization_id=? AND opportunity_id=? AND action IN ('QUALIFY','REJECT') LIMIT 1").get(orgId, item.id);
+      const nextCohort = item.cohort_assignee
+        ? item.cohort_assignee
+        : (assignee || (!hasDecision ? '' : item.cohort_assignee));
+      db.prepare('UPDATE opportunities SET assigned_to=?, cohort_assignee=?, version=version+1, updated_at=? WHERE id=? AND organization_id=?')
+        .run(assignee, nextCohort, new Date().toISOString(), item.id, orgId);
       history(db, item.id, 'ASSIGNED', assignee ? `指派跟进负责人：${assignee}` : '已清除跟进负责人指派', { assigned_to: assignee, previous: item.assigned_to }, ctx);
       return { status: 200, body: opportunity(db, item.id, orgId) };
     });
@@ -286,18 +329,22 @@ export function salesApi(db, path, method, body, query, ctx = null) {
       const item = opportunity(db, match[1], orgId); version(item, body);
       const transition = Object.hasOwn(transitions, body.action) ? transitions[body.action] : null;
       requireValue(transition && transition.from.includes(item.qualification_status), '当前状态不允许这个操作。', undefined, 409, 'INVALID_TRANSITION');
+      if (body.action === 'REOPEN') {
+        requireValue(!ctx || ctx.role === 'OWNER', '仅工作区负责人（OWNER）可执行重新激活（REOPEN）操作。', undefined, 403, 'FORBIDDEN');
+      }
       if (body.action === 'START_REVIEW' && item.qualification_status === 'NEEDS_EVIDENCE') {
-        const lastRequestRow = db.prepare(`SELECT max(rowid) AS rid FROM audit_logs
-          WHERE organization_id=? AND object_id=? AND action='REQUEST_EVIDENCE'`).get(orgId, item.id);
-        const minAuditRowId = lastRequestRow?.rid ?? 0;
+        const lastReq = db.prepare(`SELECT created_at, id FROM audit_logs
+          WHERE organization_id=? AND object_id=? AND action='REQUEST_EVIDENCE'
+          ORDER BY created_at DESC, id DESC LIMIT 1`).get(orgId, item.id);
+        const minCreatedAt = lastReq?.created_at ?? '';
         const fresh = db.prepare(`SELECT e.id FROM evidence e
-          WHERE e.organization_id=? AND e.account_id=? AND e.verification_status='VERIFIED'
+          WHERE e.organization_id=? AND e.account_id=? AND e.verification_status='VERIFIED' AND COALESCE(e.availability_status,'AVAILABLE')<>'EXPIRED'
             AND (e.checked_at > ? OR EXISTS (
               SELECT 1 FROM audit_logs al
               WHERE al.organization_id=e.organization_id AND al.object_id=e.id
-                AND al.action='EVIDENCE_VERIFIED_MANUALLY' AND al.rowid > ?
+                AND al.action='EVIDENCE_VERIFIED_MANUALLY' AND al.created_at > ?
             ))
-          LIMIT 1`).get(orgId, item.account_id, item.updated_at, minAuditRowId);
+          LIMIT 1`).get(orgId, item.account_id, item.updated_at, minCreatedAt);
         requireValue(fresh, '请先补充或重新核验所缺证据，再恢复审核。');
       }
       const reason = text(body.reason, 'reason', 2000);
@@ -309,12 +356,14 @@ export function salesApi(db, path, method, body, query, ctx = null) {
           factory.status === 'ACTIVE' && factory.supported_products.includes(item.product_category) && factory.target_markets.length > 0,
           '工厂档案尚未启用或能力不匹配，请先核对。',
         );
+        const liveFit = evaluateOpportunityFit(db, item, orgId);
+        requireValue(liveFit.fit_status !== 'NOT_FIT', '该商机存在硬性适配或禁入市场冲突（NOT_FIT），不能审核合格。', 'no_known_conflict');
         requireValue(body.no_known_conflict === true, '已知存在硬约束冲突的商机不能审核合格。', 'no_known_conflict');
         pending = text(body.pending_info, 'pending_info', 2000);
         for (const role of ['PRODUCT', 'MARKET', 'REASON']) {
           const id = text(body[`${role.toLowerCase()}_evidence_id`], `${role.toLowerCase()}_evidence_id`, 100);
           const source = evidence(db, id, orgId);
-          requireValue(source.account_id === item.account_id && source.verification_status === 'VERIFIED', '请选择本品牌已核验的证据。', `${role.toLowerCase()}_evidence_id`);
+          requireValue(source.account_id === item.account_id && source.verification_status === 'VERIFIED' && source.availability_status !== 'EXPIRED', '请选择本品牌已核验且未失效的证据。', `${role.toLowerCase()}_evidence_id`);
           if (source.product_id) {
             const product = db.prepare('SELECT product_category,status FROM account_products WHERE id=? AND account_id=? AND organization_id=?').get(source.product_id, item.account_id, orgId);
             requireValue(product?.status === 'ACTIVE' && product.product_category === item.product_category, '所选产品证据不属于当前商机品类或产品已归档。', `${role.toLowerCase()}_evidence_id`);
@@ -327,8 +376,11 @@ export function salesApi(db, path, method, body, query, ctx = null) {
         for (const ref of refs) db.prepare('INSERT INTO opportunity_evidence VALUES (?,?,?,?,?)').run(orgId, item.id, ref.id, ref.role, ref.version);
         factoryVersion = factory.version;
       }
-      db.prepare('UPDATE opportunities SET qualification_status=?, reason=?, pending_info=?, factory_version=?, version=version+1, updated_at=? WHERE id=? AND organization_id=?')
-        .run(transition.to, body.action === 'QUALIFY' ? reason : item.reason, pending, factoryVersion, new Date().toISOString(), item.id, orgId);
+      const nextCohort = ['QUALIFY', 'REJECT'].includes(body.action) && !item.cohort_assignee && item.assigned_to
+        ? item.assigned_to
+        : item.cohort_assignee;
+      db.prepare('UPDATE opportunities SET qualification_status=?, reason=?, pending_info=?, factory_version=?, cohort_assignee=?, version=version+1, updated_at=? WHERE id=? AND organization_id=?')
+        .run(transition.to, body.action === 'QUALIFY' ? reason : item.reason, pending, factoryVersion, nextCohort, new Date().toISOString(), item.id, orgId);
       const fit = evaluateOpportunityFit(db, item, orgId);
       db.prepare('UPDATE opportunities SET fit_status=?, fit_checks=? WHERE id=? AND organization_id=?')
         .run(fit.fit_status, JSON.stringify(fit.fit_checks), item.id, orgId);
@@ -443,6 +495,7 @@ export function salesApi(db, path, method, body, query, ctx = null) {
     });
   }
   if ((match = path.match(/^\/opportunities\/([^/]+)\/activities\/([^/]+)\/void$/)) && method === 'POST') {
+    requireValue(!ctx || ctx.role === 'OWNER', '仅工作区负责人（OWNER）可作废销售活动记录。', undefined, 403, 'FORBIDDEN');
     return transaction(db, () => {
       const item = opportunity(db, match[1], orgId); version(item, body);
       const activity = db.prepare('SELECT id, voided_at FROM sales_activities WHERE id=? AND opportunity_id=? AND organization_id=?').get(match[2], item.id, orgId);

@@ -8,8 +8,8 @@ import {
   recordRateLimitFailure,
   transaction,
 } from './store.mjs';
-import { sealSecret, unsealSecret, base32Encode, verifyTotp } from './kms.mjs';
-import { dispatchNotification } from './connectors.mjs';
+import { sealSecret, unsealSecret, base32Encode, verifyTotpStep } from './kms.mjs';
+import { dispatchNotification, getConnectorConfig } from './connectors.mjs';
 import { AppError, requireValue, text } from './validation.mjs';
 
 const derive = promisify(scrypt);
@@ -29,6 +29,16 @@ function cookieToken(req) {
   const pairs = (req.headers.cookie || '').split(';').map(part => part.trim().split('='));
   const tokens = pairs.filter(pair => pair[0] === cookieName);
   return tokens.length === 1 && /^[A-Za-z0-9_-]{43}$/.test(tokens[0][1] || '') ? tokens[0][1] : null;
+}
+
+function bearerToken(req) {
+  const header = String(req?.headers?.authorization || '').trim();
+  const match = header.match(/^Bearer\s+([A-Za-z0-9_-]{43})$/i);
+  return match ? match[1] : null;
+}
+
+function requestToken(req) {
+  return cookieToken(req) || bearerToken(req);
 }
 
 export function isHttpsRequest(req) {
@@ -52,6 +62,23 @@ function clearCookie(req, res) {
 
 export function createAuth(db) {
   let busy = 0;
+  const waitQueue = [];
+  async function acquireSlot() {
+    if (busy < 2) {
+      busy++;
+      return;
+    }
+    requireValue(waitQueue.length < 16, '系统认证繁忙，请稍后再试。', undefined, 429, 'AUTH_RATE_LIMIT');
+    await new Promise(resolve => waitQueue.push(resolve));
+  }
+  function releaseSlot() {
+    if (waitQueue.length > 0) {
+      const next = waitQueue.shift();
+      next();
+    } else {
+      busy = Math.max(0, busy - 1);
+    }
+  }
   const defaultOwner = () => db.prepare('SELECT * FROM local_owners WHERE organization_id=?').get(ORG);
   const orgBySlugOrId = key => {
     const k = String(key || '').trim();
@@ -59,10 +86,16 @@ export function createAuth(db) {
     return db.prepare('SELECT * FROM organizations WHERE id=? OR slug=?').get(k, k) || null;
   };
   const ownerForOrg = orgId => db.prepare('SELECT * FROM local_owners WHERE organization_id=?').get(orgId);
-  const clientKey = req => `ip:${req?.socket?.remoteAddress || '127.0.0.1'}`;
+  const clientKey = req => {
+    if (process.env.TRUST_PROXY === '1') {
+      const forwarded = String(req?.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
+      if (forwarded) return `ip:${forwarded}`;
+    }
+    return `ip:${req?.socket?.remoteAddress || '127.0.0.1'}`;
+  };
 
   function session(req) {
-    const token = cookieToken(req);
+    const token = requestToken(req);
     if (!token) return null;
     const tokenHash = digest(token);
     const now = new Date().toISOString();
@@ -121,14 +154,14 @@ export function createAuth(db) {
   }
 
   function deletePreviousCookieSession(req) {
-    const previous = cookieToken(req);
+    const previous = requestToken(req);
     if (!previous) return;
     const h = digest(previous);
     db.prepare('DELETE FROM auth_sessions WHERE token_hash=?').run(h);
     db.prepare('DELETE FROM member_sessions WHERE token_hash=?').run(h);
   }
 
-  function issue(principalId, userType, res, req) {
+  function issue(principalId, userType, res, req, { includeBearerToken = false } = {}) {
     const token = randomBytes(32).toString('base64url');
     const now = new Date();
     const nowIso = now.toISOString();
@@ -144,7 +177,7 @@ export function createAuth(db) {
         .run(digest(token), principalId, nowIso, expiresAt, randomUUID());
     }
     sessionCookie(req, res, token);
-    return { expires_at: expiresAt };
+    return includeBearerToken ? { expires_at: expiresAt, token } : { expires_at: expiresAt };
   }
 
   async function verifySecret(value, record) {
@@ -158,8 +191,8 @@ export function createAuth(db) {
   async function expensive(req, action, { countFailure = false, bucket = 'auth_login' } = {}) {
     const key = clientKey(req);
     const rate = checkAndRecordRateLimit(db, bucket, key, 9, 15 * 60 * 1000, { record: false });
-    requireValue(rate.allowed && busy < 2, '尝试次数过多，请稍后再试。登录尝试窗口为 15 分钟。', undefined, 429, 'AUTH_RATE_LIMIT');
-    busy++;
+    requireValue(rate.allowed, '尝试次数过多，请稍后再试。登录尝试窗口为 15 分钟。', undefined, 429, 'AUTH_RATE_LIMIT');
+    await acquireSlot();
     try {
       return await action();
     } catch (error) {
@@ -168,34 +201,30 @@ export function createAuth(db) {
       }
       throw error;
     } finally {
-      busy--;
+      releaseSlot();
     }
   }
 
   function resolvePrincipalForLogin(username, orgKey = '') {
-    if (!username) return { principal: null, userType: 'OWNER', orgId: ORG };
+    if (!username) return { principal: null, userType: 'OWNER', orgId: ORG, ambiguous: false };
     if (orgKey) {
       const org = orgBySlugOrId(orgKey);
-      if (!org) return { principal: null, userType: 'OWNER', orgId: '' };
+      if (!org) return { principal: null, userType: 'OWNER', orgId: '', ambiguous: false };
       const ow = ownerForOrg(org.id);
-      if (ow && ow.username === username) return { principal: ow, userType: 'OWNER', orgId: org.id };
+      if (ow && ow.username === username) return { principal: ow, userType: 'OWNER', orgId: org.id, ambiguous: false };
       const mb = db.prepare("SELECT * FROM workspace_members WHERE organization_id=? AND username=? AND status='ACTIVE'").get(org.id, username);
-      if (mb) return { principal: mb, userType: 'MEMBER', orgId: org.id };
-      return { principal: null, userType: 'OWNER', orgId: org.id };
+      if (mb) return { principal: mb, userType: 'MEMBER', orgId: org.id, ambiguous: false };
+      return { principal: null, userType: 'OWNER', orgId: org.id, ambiguous: false };
     }
-    const defaultOw = ownerForOrg(ORG);
-    if (defaultOw && defaultOw.username === username) return { principal: defaultOw, userType: 'OWNER', orgId: ORG };
-    const defaultMb = db.prepare("SELECT * FROM workspace_members WHERE organization_id=? AND username=? AND status='ACTIVE'").get(ORG, username);
-    if (defaultMb) return { principal: defaultMb, userType: 'MEMBER', orgId: ORG };
-
     const owners = db.prepare('SELECT * FROM local_owners WHERE username=?').all(username);
     const members = db.prepare("SELECT * FROM workspace_members WHERE username=? AND status='ACTIVE'").all(username);
     const matches = [
       ...owners.map(o => ({ principal: o, userType: 'OWNER', orgId: o.organization_id })),
       ...members.map(m => ({ principal: m, userType: 'MEMBER', orgId: m.organization_id })),
     ];
-    if (matches.length === 1) return matches[0];
-    return { principal: null, userType: 'OWNER', orgId: ORG };
+    if (matches.length === 1) return { ...matches[0], ambiguous: false };
+    if (matches.length > 1) return { principal: null, userType: 'OWNER', orgId: '', ambiguous: true };
+    return { principal: null, userType: 'OWNER', orgId: ORG, ambiguous: false };
   }
 
   function principalRecord(current) {
@@ -321,23 +350,34 @@ export function createAuth(db) {
     if (path === '/login' && method === 'POST') return expensive(req, async () => {
       const username = typeof body.username === 'string' ? body.username.trim().toLowerCase() : '';
       const orgKey = typeof (body.org_slug ?? body.organization_id) === 'string' ? String(body.org_slug ?? body.organization_id).trim() : '';
-      const { principal, userType, orgId } = resolvePrincipalForLogin(username, orgKey);
+      const { principal, userType, orgId, ambiguous } = resolvePrincipalForLogin(username, orgKey);
+      requireValue(!ambiguous, '存在多个同名工作区账号，请填写工作区标识（org_slug）后再登录。', 'org_slug', 400, 'AMBIGUOUS_ORGANIZATION');
       await verifySecret(body.password, principal);
       requireValue(username && principal.username === username, '账号或密码不正确。', undefined, 401, 'INVALID_CREDENTIALS');
+      let usedTotpStep = null;
       if (principal.mfa_enabled) {
         const code = typeof body.totp_code === 'string' ? body.totp_code.trim() : '';
         requireValue(code.length > 0, '该账号已开启双因素认证，请输入 6 位动态验证码。', 'totp_code', 401, 'MFA_REQUIRED');
         const secretBase32 = unsealSecret(principal.mfa_secret_enc);
-        requireValue(secretBase32 && verifyTotp(secretBase32, code), '双因素动态验证码无效或已过期。', 'totp_code', 401, 'INVALID_MFA');
+        const totp = secretBase32 ? verifyTotpStep(secretBase32, code, Date.now(), 1, Number(principal.mfa_last_used_step ?? -1)) : { valid: false, step: -1 };
+        requireValue(totp.valid, '双因素动态验证码无效、已过期或已被使用。', 'totp_code', 401, 'INVALID_MFA');
+        usedTotpStep = totp.step;
       }
       return transaction(db, () => {
+        const table = userType === 'OWNER' ? 'local_owners' : 'workspace_members';
         const fresh = userType === 'OWNER'
           ? db.prepare('SELECT * FROM local_owners WHERE id=?').get(principal.id)
           : db.prepare("SELECT * FROM workspace_members WHERE id=? AND status='ACTIVE'").get(principal.id);
         requireValue(fresh?.credential_version === principal.credential_version, '登录凭据已变化，请重试。', undefined, 401, 'INVALID_CREDENTIALS');
+        if (usedTotpStep !== null) {
+          const stepUpdate = db.prepare(`UPDATE ${table} SET mfa_last_used_step=? WHERE id=? AND mfa_last_used_step < ?`)
+            .run(usedTotpStep, principal.id, usedTotpStep);
+          requireValue(stepUpdate.changes === 1, '双因素动态验证码已被使用，请等待下一周期验证码。', 'totp_code', 401, 'INVALID_MFA');
+        }
         const actorRole = userType === 'OWNER' ? 'OWNER' : fresh.role;
         audit(db, 'OWNER_LOGGED_IN', principal.id, { user_type: userType, mfa: Boolean(fresh.mfa_enabled) }, { orgId, actor: `${actorRole}:${fresh.username}` });
-        return { status: 200, body: { authenticated: true, organization_id: orgId, ...issue(principal.id, userType, res, req) } };
+        const includeBearer = body.issue_bearer_token === true || body.token_mode === 'bearer';
+        return { status: 200, body: { authenticated: true, organization_id: orgId, ...issue(principal.id, userType, res, req, { includeBearerToken: includeBearer }) } };
       });
     }, { countFailure: true, bucket: 'auth_login' });
     if (path === '/logout' && method === 'POST') {
@@ -375,11 +415,14 @@ export function createAuth(db) {
     }
     if (path === '/mfa/setup' && method === 'POST') {
       const current = requireSession(req);
+      const record = principalRecord(current);
+      requireValue(!record?.mfa_enabled, '已开启双因素认证，如需重新绑定请先停用现有认证器。', undefined, 409, 'MFA_ALREADY_ENABLED');
       const secretBase32 = base32Encode(randomBytes(20));
       const sealed = sealSecret(secretBase32);
       const table = current.userType === 'MEMBER' ? 'workspace_members' : 'local_owners';
       transaction(db, () => {
-        db.prepare(`UPDATE ${table} SET mfa_secret_enc=? WHERE id=? AND organization_id=?`).run(sealed, current.id, current.organization_id);
+        db.prepare(`UPDATE ${table} SET mfa_secret_enc=?, mfa_last_used_step=-1 WHERE id=? AND organization_id=? AND mfa_enabled=0`)
+          .run(sealed, current.id, current.organization_id);
         audit(db, 'MFA_SETUP_INITIATED', current.id, {}, ctxOf(current));
       });
       const label = encodeURIComponent(`Botein:${current.username}`);
@@ -395,16 +438,22 @@ export function createAuth(db) {
     if (path === '/mfa/enable' && method === 'POST') {
       const current = requireSession(req);
       const record = principalRecord(current);
+      requireValue(!record?.mfa_enabled, '双因素认证已开启。', undefined, 409, 'MFA_ALREADY_ENABLED');
       requireValue(record?.mfa_secret_enc, '请先生成双因素认证密钥。', undefined, 409, 'MFA_NOT_INITIALIZED');
-      const code = text(body.totp_code, 'totp_code', 16);
-      const secretBase32 = unsealSecret(record.mfa_secret_enc);
-      requireValue(secretBase32 && verifyTotp(secretBase32, code), '动态验证码无效，请核对时间或重新扫码。', 'totp_code', 422, 'INVALID_MFA');
-      const table = current.userType === 'MEMBER' ? 'workspace_members' : 'local_owners';
-      transaction(db, () => {
-        db.prepare(`UPDATE ${table} SET mfa_enabled=1 WHERE id=? AND organization_id=?`).run(current.id, current.organization_id);
-        audit(db, 'MFA_ENABLED', current.id, {}, ctxOf(current));
-      });
-      return { status: 200, body: { mfa_enabled: true } };
+      return expensive(req, async () => {
+        const code = text(body.totp_code, 'totp_code', 16);
+        const secretBase32 = unsealSecret(record.mfa_secret_enc);
+        const totp = secretBase32 ? verifyTotpStep(secretBase32, code, Date.now(), 1, Number(record.mfa_last_used_step ?? -1)) : { valid: false, step: -1 };
+        requireValue(totp.valid, '动态验证码无效，请核对时间或重新扫码。', 'totp_code', 422, 'INVALID_MFA');
+        const table = current.userType === 'MEMBER' ? 'workspace_members' : 'local_owners';
+        transaction(db, () => {
+          const updated = db.prepare(`UPDATE ${table} SET mfa_enabled=1, mfa_last_used_step=? WHERE id=? AND organization_id=? AND mfa_enabled=0`)
+            .run(totp.step, current.id, current.organization_id);
+          requireValue(updated.changes === 1, '双因素认证状态已变化，请刷新重试。', undefined, 409, 'VERSION_CONFLICT');
+          audit(db, 'MFA_ENABLED', current.id, {}, ctxOf(current));
+        });
+        return { status: 200, body: { mfa_enabled: true } };
+      }, { countFailure: true, bucket: 'auth_mfa' });
     }
     if (path === '/mfa/disable' && method === 'POST') {
       const current = requireSession(req);
@@ -414,11 +463,13 @@ export function createAuth(db) {
         if (record.mfa_enabled && record.mfa_secret_enc) {
           const code = text(body.totp_code, 'totp_code', 16);
           const secretBase32 = unsealSecret(record.mfa_secret_enc);
-          requireValue(secretBase32 && verifyTotp(secretBase32, code), '动态验证码无效。', 'totp_code', 401, 'INVALID_MFA');
+          const totp = secretBase32 ? verifyTotpStep(secretBase32, code, Date.now(), 1, Number(record.mfa_last_used_step ?? -1)) : { valid: false, step: -1 };
+          requireValue(totp.valid, '动态验证码无效。', 'totp_code', 401, 'INVALID_MFA');
         }
         const table = current.userType === 'MEMBER' ? 'workspace_members' : 'local_owners';
         transaction(db, () => {
-          db.prepare(`UPDATE ${table} SET mfa_enabled=0, mfa_secret_enc='' WHERE id=? AND organization_id=?`).run(current.id, current.organization_id);
+          db.prepare(`UPDATE ${table} SET mfa_enabled=0, mfa_secret_enc='', mfa_last_used_step=-1 WHERE id=? AND organization_id=?`)
+            .run(current.id, current.organization_id);
           audit(db, 'MFA_DISABLED', current.id, {}, ctxOf(current));
         });
         return { status: 200, body: { mfa_enabled: false } };
@@ -430,6 +481,7 @@ export function createAuth(db) {
       const username = text(body.username, 'username', 64).toLowerCase();
       const orgKey = typeof (body.org_slug ?? body.organization_id) === 'string' ? String(body.org_slug ?? body.organization_id).trim() : '';
       const resolved = resolvePrincipalForLogin(username, orgKey);
+      requireValue(!resolved.ambiguous, '存在多个同名工作区账号，请填写工作区标识（org_slug）后再申请重置。', 'org_slug', 400, 'AMBIGUOUS_ORGANIZATION');
       if (resolved.principal) {
         const rawToken = randomBytes(24).toString('base64url');
         const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
@@ -521,9 +573,16 @@ export function createAuth(db) {
           expires_at: expiresAt,
         },
       }, ctxOf(current));
+      const notifyCfg = getConnectorConfig(db, 'OUTBOUND_NOTIFY', ctxOf(current));
+      const hideTokenInResponse = notifyCfg.enabled || process.env.HIDE_INVITE_TOKEN_RESPONSE === '1';
       return {
         status: 201,
-        body: { id, username, display_name: displayName, email, role, status: 'PENDING', expires_at: expiresAt, created_at: now, invite_token: rawToken },
+        body: {
+          id, username, display_name: displayName, email, role, status: 'PENDING',
+          expires_at: expiresAt, created_at: now,
+          delivery_channel: notifyCfg.enabled ? 'OUTBOUND_NOTIFY' : 'MANUAL_COPY',
+          ...(hideTokenInResponse ? {} : { invite_token: rawToken }),
+        },
       };
     }
     const inviteRevoke = path.match(/^\/invitations\/([^/]+)\/revoke$/);

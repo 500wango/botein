@@ -29,7 +29,7 @@ import { discoverContacts } from './contact-discovery.mjs';
 import { monitorsApi } from './worker.mjs';
 import { listConnectorsView, saveConnectorConfig } from './connectors.mjs';
 import { getStorageConfig } from './storage.mjs';
-import { kmsStatus } from './kms.mjs';
+import { assertKmsConfigured, kmsStatus } from './kms.mjs';
 import { olderThan, pageParams, pageRows } from './pagination.mjs';
 import { defaultDatabasePath } from './paths.mjs';
 import { searchWeb, searchStatus, searchConfig } from './search.mjs';
@@ -40,7 +40,10 @@ import { AppError, requireValue, publicUrl, accountInput, factoryInput, parseCsv
 const publicDir = fileURLToPath(new URL('../public/', import.meta.url));
 const assets = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
+  ['/welcome', ['index.html', 'text/html; charset=utf-8']],
+  ['/app', ['index.html', 'text/html; charset=utf-8']],
   ['/auth.js', ['auth.js', 'text/javascript; charset=utf-8']],
+  ['/landing.js', ['landing.js', 'text/javascript; charset=utf-8']],
   ['/contacts.js', ['contacts.js', 'text/javascript; charset=utf-8']],
   ['/accounts.js', ['accounts.js', 'text/javascript; charset=utf-8']],
   ['/data-transfer.js', ['data-transfer.js', 'text/javascript; charset=utf-8']],
@@ -116,7 +119,7 @@ function validateHostAndOrigin(req, res, port) {
     res.setHeader('Access-Control-Allow-Origin', reqOrigin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Idempotency-Key');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Idempotency-Key');
     res.setHeader('Vary', 'Origin');
   }
   requireValue(!reqOrigin || reqOrigin === expectedOrigin || corsMatched, '跨来源请求已拒绝。', undefined, 403, 'ORIGIN_REJECTED');
@@ -127,6 +130,7 @@ function validateHostAndOrigin(req, res, port) {
 }
 
 export function createApplication({ databasePath = defaultDatabasePath(), services = defaultServices } = {}) {
+  assertKmsConfigured();
   const db = openStore(databasePath);
   const auth = createAuth(db);
   const server = createServer(async (req, res) => {
@@ -339,6 +343,7 @@ export function createApplication({ databasePath = defaultDatabasePath(), servic
       }
 
       if (/^\/api\/v1\/accounts\/[^/]+$/.test(route) || /^\/api\/v1\/account-identity-reviews(?:\/[^/]+\/resolve)?$/.test(route)) {
+        if (/^\/api\/v1\/account-identity-reviews\/[^/]+\/resolve$/.test(route) && method === 'POST') auth.requireOwner(req);
         const body = ['POST', 'PATCH'].includes(method) ? requestBody : {};
         const result = accountsApi(db, route.slice('/api/v1'.length), method, body, url.searchParams, ctx);
         return json(res, result.status, result.body);
@@ -398,6 +403,7 @@ export function createApplication({ databasePath = defaultDatabasePath(), servic
       }
 
       if (/^\/api\/v1\/drafts\//.test(route) || /^\/api\/v1\/opportunities\/[^/]+\/drafts$/.test(route) || route === '/api/v1/factory-profile/checks' || route === '/api/v1/factory-profile/checks/options') {
+        if (route === '/api/v1/factory-profile/checks' && method === 'POST') auth.requireOwner(req);
         const body = ['POST', 'PATCH'].includes(method) ? requestBody : {};
         const result = draftsApi(db, route.slice('/api/v1'.length), method, body, url.searchParams, ctx);
         return json(res, result.status, result.body);
@@ -487,6 +493,7 @@ export function createApplication({ databasePath = defaultDatabasePath(), servic
             code: error.code || 'INTERNAL_ERROR',
             message: error instanceof AppError ? error.message : '保存失败，请重试。',
             field: error.field,
+            ...(error.details ? { details: error.details } : {}),
             request_id: requestId,
           },
         });

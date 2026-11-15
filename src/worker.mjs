@@ -20,14 +20,14 @@ export function claimNextResearchJob(db, workerId = `worker-${process.pid}`, lea
         AND (r.source_mode <> 'DISCOVERY' OR NOT EXISTS (
           SELECT 1 FROM research_jobs active
           WHERE active.organization_id=r.organization_id AND active.source_mode='DISCOVERY'
-            AND active.status='RUNNING' AND (active.lease_expires_at IS NULL OR active.lease_expires_at > ?)
+            AND (active.status='RUNNING' OR (active.worker_id IS NOT NULL AND active.lease_expires_at > ?))
         ))
       ORDER BY r.created_at ASC, r.rowid ASC LIMIT 1`).get(nowIso);
     if (!candidate) return null;
     const res = db.prepare(`UPDATE research_jobs
-      SET worker_id=?, lease_expires_at=?, heartbeat_at=?, version=version+1
+      SET status='RUNNING', started_at=COALESCE(started_at, ?), worker_id=?, lease_expires_at=?, heartbeat_at=?, version=version+1
       WHERE id=? AND organization_id=? AND status='QUEUED'`)
-      .run(workerId, leaseUntil, nowIso, candidate.id, candidate.organization_id);
+      .run(nowIso, workerId, leaseUntil, nowIso, candidate.id, candidate.organization_id);
     if (!res.changes) return null;
     return db.prepare('SELECT * FROM research_jobs WHERE id=?').get(candidate.id);
   });

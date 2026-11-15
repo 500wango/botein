@@ -370,6 +370,17 @@ export function openStore(path, env = process.env) {
         );
         PRAGMA user_version = 17;`);
     }
+    if (db.prepare('PRAGMA user_version').get().user_version < 18) {
+      db.exec(`ALTER TABLE local_owners ADD COLUMN mfa_last_used_step INTEGER NOT NULL DEFAULT -1;
+        ALTER TABLE workspace_members ADD COLUMN mfa_last_used_step INTEGER NOT NULL DEFAULT -1;
+        ALTER TABLE opportunities ADD COLUMN cohort_assignee TEXT NOT NULL DEFAULT '';
+        ALTER TABLE opportunities ADD COLUMN estimated_order_quantity INTEGER;
+        UPDATE opportunities SET cohort_assignee = assigned_to WHERE cohort_assignee = '' AND assigned_to <> '';
+        ALTER TABLE research_job_results ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE research_job_failures ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1;
+        CREATE INDEX IF NOT EXISTS idx_failures_job_attempt ON research_job_failures(organization_id, research_job_id, attempt, created_at);
+        PRAGMA user_version = 18;`);
+    }
   });
   ensureOrganization(db, { id: ORG, name: 'LANCCO 本地工作空间', slug: 'local-lancco' });
   recoverInterruptedResearchJobs(db);
@@ -418,7 +429,7 @@ export function recoverInterruptedResearchJobs(db) {
   const now = new Date().toISOString();
   const workerMode = String(process.env.RESEARCH_WORKER_MODE || 'embedded').toLowerCase();
   const stale = workerMode === 'external'
-    ? db.prepare("SELECT id, organization_id FROM research_jobs WHERE status='RUNNING' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?").all(now)
+    ? db.prepare("SELECT id, organization_id FROM research_jobs WHERE status='RUNNING' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)").all(now)
     : db.prepare("SELECT id, organization_id FROM research_jobs WHERE status IN ('QUEUED', 'RUNNING') AND (worker_id IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)").all(now);
   if (!stale.length) return 0;
   return transaction(db, () => {
@@ -433,10 +444,38 @@ export function recoverInterruptedResearchJobs(db) {
     return stale.length;
   });
 }
+const txDepthMap = new WeakMap();
+let savepointSeq = 0;
+
 export function transaction(db, action) {
-  db.exec('BEGIN IMMEDIATE');
-  try { const result = action(); db.exec('COMMIT'); return result; }
-  catch (error) { db.exec('ROLLBACK'); throw error; }
+  const depth = txDepthMap.get(db) || 0;
+  if (depth === 0) {
+    db.exec('BEGIN IMMEDIATE');
+    txDepthMap.set(db, 1);
+    try {
+      const result = action();
+      db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch {}
+      throw error;
+    } finally {
+      txDepthMap.set(db, 0);
+    }
+  }
+  const sp = `sp_${depth}_${++savepointSeq}`;
+  db.exec(`SAVEPOINT ${sp}`);
+  txDepthMap.set(db, depth + 1);
+  try {
+    const result = action();
+    db.exec(`RELEASE SAVEPOINT ${sp}`);
+    return result;
+  } catch (error) {
+    try { db.exec(`ROLLBACK TO SAVEPOINT ${sp}; RELEASE SAVEPOINT ${sp}`); } catch {}
+    throw error;
+  } finally {
+    txDepthMap.set(db, depth);
+  }
 }
 export function audit(db, action, objectId, details = {}, ctx = null) {
   const { orgId, actor } = requestContext(ctx);

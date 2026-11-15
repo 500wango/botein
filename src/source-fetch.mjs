@@ -132,7 +132,7 @@ function allowFetch(bucket = 'preview') {
   store.push(now);
 }
 
-async function resolvePublicRecords(hostname) {
+export async function resolvePublicRecords(hostname) {
   let records;
   try { records = await lookup(hostname, { all: true, verbatim: true }); }
   catch { throw new AppError(422, 'SOURCE_UNRESOLVED', '无法解析来源域名。', 'url'); }
@@ -151,6 +151,118 @@ async function resolvePublicRecords(hostname) {
   }
   unique.sort((a, b) => (isIP(a.address) === 4 ? 0 : 1) - (isIP(b.address) === 4 ? 0 : 1));
   return unique;
+}
+
+export function connectorUrl(value, { allowPrivate = process.env.ALLOW_PRIVATE_CONNECTORS === '1', field = 'endpoint_url' } = {}) {
+  let url;
+  try { url = new URL(value); } catch { throw new AppError(422, 'INVALID_URL', '请填写完整的 http 或 https 接口地址。', field); }
+  const host = url.hostname.toLowerCase();
+  const rawHost = host.replace(/^\[|\]$/g, '');
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || !host || host.endsWith('.')) {
+    throw new AppError(422, 'CONNECTOR_URL_REJECTED', '外部连接器地址必须为有效的 http/https 地址且不能包含账号密码。', field);
+  }
+  if (!allowPrivate) {
+    if (host === 'localhost' || /\.(localhost|local|internal)$/i.test(host)) {
+      throw new AppError(422, 'CONNECTOR_URL_BLOCKED', '外部连接器地址不能指向本机或内网域名。', field);
+    }
+    if (isIP(rawHost) && isBlockedAddress(rawHost)) {
+      throw new AppError(422, 'CONNECTOR_URL_BLOCKED', '外部连接器地址不能指向本机、内网或保留 IP。', field);
+    }
+  }
+  url.hash = '';
+  return url;
+}
+
+export async function safeExternalFetch(inputUrl, {
+  method = 'POST',
+  headers = {},
+  body = undefined,
+  signal,
+  timeoutMs = 15_000,
+  maxBytes = 1024 * 1024,
+  allowPrivate = process.env.ALLOW_PRIVATE_CONNECTORS === '1',
+} = {}) {
+  const url = connectorUrl(inputUrl, { allowPrivate, field: 'endpoint_url' });
+  let records = null;
+  if (!allowPrivate) {
+    records = await resolvePublicRecords(url.hostname);
+  } else {
+    const rawHost = url.hostname.replace(/^\[|\]$/g, '');
+    if (isIP(rawHost)) {
+      records = [{ address: rawHost, family: isIP(rawHost) }];
+    } else {
+      try {
+        records = await lookup(url.hostname, { all: true, verbatim: true });
+      } catch {
+        throw new AppError(422, 'SOURCE_UNRESOLVED', '无法解析目标域名。', 'url');
+      }
+      if (!records.length) throw new AppError(422, 'SOURCE_UNRESOLVED', '无法解析目标域名。', 'url');
+    }
+  }
+  const transport = url.protocol === 'https:' ? https : http;
+  const payload = typeof body === 'string' || Buffer.isBuffer(body) ? body : (body ? JSON.stringify(body) : null);
+  let lastError = null;
+  for (const record of records) {
+    try {
+      const family = isIP(record.address) === 6 ? 6 : 4;
+      return await new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new AppError(499, 'REQUEST_ABORTED', '外部请求已取消。'));
+          return;
+        }
+        const request = transport.request({
+          protocol: url.protocol,
+          hostname: url.hostname,
+          port: url.port || (url.protocol === 'https:' ? 443 : 80),
+          path: `${url.pathname}${url.search}`,
+          method,
+          signal,
+          headers,
+          lookup: (hostname, options, callback) => {
+            if (options?.all) callback(null, [{ address: record.address, family }]);
+            else callback(null, record.address, family);
+          },
+        }, async response => {
+          if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
+            response.resume();
+            reject(new AppError(502, 'CONNECTOR_REDIRECT_BLOCKED', '外部连接器不允许跨跳重定向。'));
+            return;
+          }
+          try {
+            const chunks = [];
+            let size = 0;
+            for await (const chunk of response) {
+              size += chunk.length;
+              if (size > maxBytes) {
+                response.destroy();
+                reject(new AppError(502, 'CONNECTOR_RESPONSE_TOO_LARGE', '外部接口响应体积超出限制。'));
+                return;
+              }
+              chunks.push(chunk);
+            }
+            const rawText = Buffer.concat(chunks).toString('utf8');
+            resolve({
+              ok: response.statusCode >= 200 && response.statusCode < 300,
+              status: response.statusCode,
+              headers: response.headers,
+              text: async () => rawText,
+              json: async () => JSON.parse(rawText || '{}'),
+            });
+          } catch (err) {
+            reject(err);
+          }
+        });
+        request.setTimeout(timeoutMs, () => request.destroy(new AppError(504, 'CONNECTOR_TIMEOUT', '外部连接器请求超时。')));
+        request.on('error', err => reject(err instanceof AppError ? err : new AppError(502, 'CONNECTOR_ERROR', err.message || '外部连接器请求失败。')));
+        if (payload !== null) request.write(payload);
+        request.end();
+      });
+    } catch (error) {
+      if (error?.code === 'REQUEST_ABORTED' || error?.code === 'CONNECTOR_REDIRECT_BLOCKED' || error?.code === 'CONNECTOR_RESPONSE_TOO_LARGE') throw error;
+      lastError = error;
+    }
+  }
+  throw lastError || new AppError(502, 'CONNECTOR_ERROR', '外部连接器请求失败。');
 }
 
 function requestOnce(url, address, signal) {
@@ -254,13 +366,16 @@ function isLikelySpaShell(html, extractedText) {
 
 export async function renderSpaWithChrome(targetUrl, pinnedAddress, { chromeBin = process.env.CHROME_BIN || 'google-chrome', signal } = {}) {
   const host = targetUrl.hostname;
+  const mappedAddress = isIP(pinnedAddress) === 6 ? `[${pinnedAddress}]` : pinnedAddress;
   const { stdout } = await execFileAsync(chromeBin, [
     '--headless=new',
     '--disable-gpu',
     '--no-sandbox',
     '--disable-dev-shm-usage',
+    '--disable-background-networking',
+    '--disable-extensions',
     '--dump-dom',
-    `--host-resolver-rules=MAP ${host} ${pinnedAddress}`,
+    `--host-resolver-rules=MAP ${host} ${mappedAddress}, MAP * ~NOTFOUND`,
     targetUrl.href,
   ], { timeout: TIMEOUT_MS, maxBuffer: MAX_DECOMPRESSED_BYTES, signal });
   return String(stdout || '');

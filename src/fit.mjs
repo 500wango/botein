@@ -19,7 +19,7 @@ function categoryLabel(code) {
   return PRODUCT_CATEGORIES[code]?.label ?? code;
 }
 
-function checkProductionTerm(term, products, oppCategory) {
+function checkProductionTerm(term, products, oppCategory, requestedMoq, monthlyCapacity) {
   const category = term.product_category || oppCategory || '';
   if (category && products.length > 0 && !products.some((p) => p.product_category === category)) {
     return { applicable: false };
@@ -28,10 +28,38 @@ function checkProductionTerm(term, products, oppCategory) {
   if (!hasAnyMoq && !term.unit && !term.packaging_spec) {
     return { applicable: true, status: 'UNKNOWN', detail: `${categoryLabel(category)} 尚未配置具体 MOQ 与包装条件。` };
   }
+  if (requestedMoq == null) {
+    return {
+      applicable: true,
+      status: 'UNKNOWN',
+      detail: `工厂已配置 ${categoryLabel(category)} MOQ（${term.min_moq ?? '未限'}${term.max_moq != null ? `-${term.max_moq}` : '+'} ${term.unit || ''}），但客户实际采购量与包装/交期要求尚未确认，暂列为需核对。`.trim(),
+    };
+  }
+  if (term.min_moq != null && requestedMoq < term.min_moq) {
+    return {
+      applicable: true,
+      status: 'CONFLICT',
+      detail: `客户预估采购量 (${requestedMoq}) 低于工厂 ${categoryLabel(category)} 最小 MOQ (${term.min_moq} ${term.unit || ''})。`.trim(),
+    };
+  }
+  if (term.max_moq != null && requestedMoq > term.max_moq) {
+    return {
+      applicable: true,
+      status: 'CONFLICT',
+      detail: `客户预估采购量 (${requestedMoq}) 高于工厂 ${categoryLabel(category)} 最大单批承接量 (${term.max_moq} ${term.unit || ''})。`.trim(),
+    };
+  }
+  if (monthlyCapacity != null && requestedMoq > monthlyCapacity) {
+    return {
+      applicable: true,
+      status: 'CONFLICT',
+      detail: `客户预估采购量 (${requestedMoq}) 超出工厂月产能上限 (${monthlyCapacity})。`,
+    };
+  }
   return {
     applicable: true,
     status: 'PASS',
-    detail: `已配置 ${categoryLabel(category)} 生产条件（MOQ ${term.min_moq ?? '未限'}${term.max_moq != null ? `-${term.max_moq}` : '+'} ${term.unit || ''}）。`.trim(),
+    detail: `客户需求量 (${requestedMoq} ${term.unit || ''}) 符合工厂 ${categoryLabel(category)} MOQ 与产能范围（${term.min_moq ?? '不限'}${term.max_moq != null ? `-${term.max_moq}` : '+'}）。`.trim(),
   };
 }
 
@@ -105,12 +133,12 @@ export function evaluateOpportunityFit(db, opportunity, orgId = ORG) {
   }
 
   // 2. Market & prohibited market checks
-  const accountMarkets = [...new Set([
-    ...(account?.headquarters_country ? [account.headquarters_country.toUpperCase()] : []),
-    ...products.map((p) => (p.marketplace || '').toUpperCase()).filter((m) => /^[A-Z]{2}$/.test(m)),
-  ].filter(Boolean))];
+  // Target market matches actual product sales marketplaces; prohibited markets check both HQ country & sales marketplaces.
+  const hqCountry = account?.headquarters_country ? account.headquarters_country.toUpperCase() : '';
+  const salesMarkets = [...new Set(products.map((p) => (p.marketplace || '').toUpperCase()).filter((m) => /^[A-Z]{2}$/.test(m)))];
+  const prohibitedCheckMarkets = [...new Set([...(hqCountry ? [hqCountry] : []), ...salesMarkets])];
 
-  const prohibitedHit = accountMarkets.find((m) => prohibitedMarkets.has(m));
+  const prohibitedHit = prohibitedCheckMarkets.find((m) => prohibitedMarkets.has(m));
   if (prohibitedHit) {
     checks.push({
       code: 'PROHIBITED_MARKETS',
@@ -127,44 +155,84 @@ export function evaluateOpportunityFit(db, opportunity, orgId = ORG) {
     });
   }
 
-  if (accountMarkets.length === 0) {
+  if (salesMarkets.length === 0) {
     checks.push({
       code: 'TARGET_MARKET',
       label: '目标市场匹配',
       status: 'UNKNOWN',
-      detail: '客户尚未标注所属国家或目标市场。',
+      detail: hqCountry
+        ? `仅登记总部国家 (${marketLabel(hqCountry)})，尚未在在研产品中确认实际目标销售市场。`
+        : '客户尚未确认具体产品销售市场（marketplace）。',
     });
-  } else if (accountMarkets.some((m) => targetMarkets.has(m))) {
+  } else if (salesMarkets.some((m) => targetMarkets.has(m))) {
     checks.push({
       code: 'TARGET_MARKET',
       label: '目标市场匹配',
       status: 'PASS',
-      detail: `目标市场匹配：${accountMarkets.filter((m) => targetMarkets.has(m)).map(marketLabel).join('、')}。`,
+      detail: `目标销售市场匹配：${salesMarkets.filter((m) => targetMarkets.has(m)).map(marketLabel).join('、')}。`,
     });
   } else {
     checks.push({
       code: 'TARGET_MARKET',
       label: '目标市场匹配',
       status: 'CONFLICT',
-      detail: `客户市场 (${accountMarkets.map(marketLabel).join('、')}) 与工厂目标市场 (${[...targetMarkets].map(marketLabel).join('、') || '未配置'}) 不一致。`,
+      detail: `客户销售市场 (${salesMarkets.map(marketLabel).join('、')}) 与工厂目标市场 (${[...targetMarkets].map(marketLabel).join('、') || '未配置'}) 不一致。`,
     });
   }
 
-  // 3. Production terms / MOQ & packaging check
+  // 3. Production terms / MOQ, capacity & packaging check
+  const requestedMoq = Number.isInteger(opportunity?.estimated_order_quantity) && opportunity.estimated_order_quantity > 0
+    ? opportunity.estimated_order_quantity
+    : null;
+  const monthlyCapacity = Number.isInteger(factory?.monthly_capacity_quantity) && factory.monthly_capacity_quantity > 0
+    ? factory.monthly_capacity_quantity
+    : null;
   const activeTermResults = factoryTerms
-    .map((term) => checkProductionTerm(term, products, opportunity.product_category))
+    .map((term) => checkProductionTerm(term, products, opportunity.product_category, requestedMoq, monthlyCapacity))
     .filter((r) => r.applicable);
   const legacyTermComplete = factory?.moq_quantity != null && Boolean(factory?.unit) && Boolean(factory?.packaging_spec);
   if (activeTermResults.some((r) => r.status === 'CONFLICT')) {
     const firstConflict = activeTermResults.find((r) => r.status === 'CONFLICT');
     checks.push({ code: 'PRODUCTION_TERMS', label: 'MOQ 与包装条件', status: 'CONFLICT', detail: firstConflict.detail });
-  } else if (activeTermResults.some((r) => r.status === 'PASS') || legacyTermComplete) {
+  } else if (activeTermResults.some((r) => r.status === 'PASS')) {
     checks.push({
       code: 'PRODUCTION_TERMS',
       label: 'MOQ 与包装条件',
       status: 'PASS',
-      detail: activeTermResults.find((r) => r.status === 'PASS')?.detail || `已配置工厂 MOQ (${factory.moq_quantity} ${factory.unit}) 与包装规格。`,
+      detail: activeTermResults.find((r) => r.status === 'PASS').detail,
     });
+  } else if (activeTermResults.some((r) => r.status === 'UNKNOWN')) {
+    checks.push({
+      code: 'PRODUCTION_TERMS',
+      label: 'MOQ 与包装条件',
+      status: 'UNKNOWN',
+      detail: activeTermResults.find((r) => r.status === 'UNKNOWN').detail,
+    });
+  } else if (legacyTermComplete) {
+    if (requestedMoq == null) {
+      checks.push({
+        code: 'PRODUCTION_TERMS',
+        label: 'MOQ 与包装条件',
+        status: 'UNKNOWN',
+        detail: `已配置工厂 MOQ (${factory.moq_quantity} ${factory.unit})，但客户采购量与具体规格要求尚未知，需人工复核。`,
+      });
+    } else if (requestedMoq < factory.moq_quantity || (monthlyCapacity != null && requestedMoq > monthlyCapacity)) {
+      checks.push({
+        code: 'PRODUCTION_TERMS',
+        label: 'MOQ 与包装条件',
+        status: 'CONFLICT',
+        detail: requestedMoq < factory.moq_quantity
+          ? `客户预估采购量 (${requestedMoq}) 低于工厂 MOQ (${factory.moq_quantity} ${factory.unit})。`
+          : `客户预估采购量 (${requestedMoq}) 超出工厂月产能上限 (${monthlyCapacity})。`,
+      });
+    } else {
+      checks.push({
+        code: 'PRODUCTION_TERMS',
+        label: 'MOQ 与包装条件',
+        status: 'PASS',
+        detail: `客户需求量 (${requestedMoq} ${factory.unit}) 符合工厂 MOQ (${factory.moq_quantity} ${factory.unit}) 与产能要求。`,
+      });
+    }
   } else {
     checks.push({
       code: 'PRODUCTION_TERMS',

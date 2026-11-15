@@ -5,16 +5,17 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
 import { createApplication } from './server.mjs';
-import { htmlToText, isBlockedAddress } from './source-fetch.mjs';
+import { connectorUrl, htmlToText, isBlockedAddress, safeExternalFetch } from './source-fetch.mjs';
 import { extractJsonObject } from './model.mjs';
-import { recoverInterruptedResearchJobs } from './store.mjs';
+import { recoverInterruptedResearchJobs, transaction } from './store.mjs';
 import { backupDatabase, verifyBackup } from './maintenance.mjs';
 import { pageParams } from './pagination.mjs';
 import { sourceMatchesHost } from './sources.mjs';
-import { generateTotp, sealSecret, unsealSecret, kmsStatus } from './kms.mjs';
-import { runWorkerTick } from './worker.mjs';
-import { queryExternalContactsConnector } from './connectors.mjs';
+import { assertKmsConfigured, generateTotp, isKmsProductionEnforced, sealSecret, unsealSecret, kmsStatus, verifyTotpStep } from './kms.mjs';
+import { claimNextResearchJob, runWorkerTick } from './worker.mjs';
+import { queryExternalContactsConnector, redactSensitivePayload } from './connectors.mjs';
 import { exportPostgresDdl, getStorageConfig } from './storage.mjs';
 import { rewritePlaceholders, translateSqliteToPostgres } from './pg-store.mjs';
 
@@ -1349,11 +1350,30 @@ test('pool PRIORITY_REVIEW requires verified category evidence without QUALIFIED
       published_at: '2026-10-01', raw_text: 'Pure laundry pods available in US stores.',
     })).body;
     await app.request(`/evidence/${evA.id}/verify`, 'POST', { expected_version: evA.version, reason: '核对官方官网。', confirmed: true });
-    const oppA = (await app.request('/opportunities', 'POST', { account_id: brandA.id, reason: 'US laundry pods brand with verified first-party evidence' })).body;
+    let oppA = (await app.request('/opportunities', 'POST', { account_id: brandA.id, reason: 'US laundry pods brand with verified first-party evidence' })).body;
     assert.equal(oppA.qualification_status, 'NEW');
+    // Without confirmed product marketplace or estimated_order_quantity, fit requires human review (PRD 10.1)
+    assert.equal(oppA.fit_status, 'NEEDS_REVIEW');
+
+    // Provide product marketplace (with reason + re-verify evidence) & customer order quantity below factory MOQ => NOT_FIT, then >= min_moq => ELIGIBLE
+    const updProdA = await app.request(`/accounts/${brandA.id}/products/${prodA.id}`, 'PATCH', {
+      product_name: 'Pure Pods', product_category: 'LAUNDRY_PODS', product_url: 'https://firstparty.example.com/pods',
+      marketplace: 'US', status: 'ACTIVE', expected_version: prodA.version, reason: '确认美国站销售渠道。',
+    });
+    assert.equal(updProdA.status, 200, JSON.stringify(updProdA.body));
+    const evAUpdated = (await app.request('/evidence')).body.items.find(e => e.id === evA.id);
+    await app.request(`/evidence/${evA.id}/verify`, 'POST', { expected_version: evAUpdated.version, reason: '复核官方官网与美国市场属性。', confirmed: true });
+    const oppTooSmall = (await app.request(`/opportunities/${oppA.id}/fit`, 'PATCH', {
+      expected_version: oppA.version, estimated_order_quantity: 100,
+    })).body;
+    assert.equal(oppTooSmall.fit_status, 'NOT_FIT');
+    oppA = (await app.request(`/opportunities/${oppTooSmall.id}/fit`, 'PATCH', {
+      expected_version: oppTooSmall.version, estimated_order_quantity: 10000,
+    })).body;
     assert.equal(oppA.fit_status, 'ELIGIBLE');
     assert.ok(oppA.fit_checks.some(c => c.code === 'CERTIFICATIONS' && c.status === 'PASS'));
     assert.ok(oppA.fit_checks.some(c => c.code === 'BASE_EVIDENCE' && c.status === 'PASS'));
+    assert.ok(oppA.fit_checks.some(c => c.code === 'PRODUCTION_TERMS' && c.status === 'PASS'));
 
     // Prohibited market brand => NOT_FIT
     const brandB = (await app.request('/accounts', 'POST', { brand_name: 'Euro Brand', website: 'https://euro.example.com', headquarters_country: 'EU' })).body;
@@ -1832,17 +1852,29 @@ test('multi-org tenant isolation, invitations, password reset, TOTP MFA, KMS, DB
     await fetchB('/accounts', 'POST', { brand_name: 'OrgB Only Brand', website: 'https://orgb.example.com' });
     assert.equal((await app.request('/accounts')).body.items.some(a => a.brand_name === 'OrgB Only Brand'), false);
 
-    // 4. TOTP MFA setup + enable + enforced on login
+    // 4. TOTP MFA setup + enable + replay protection + enforced on login
     const mfaSetup = await fetchB('/auth/mfa/setup', 'POST', {});
     assert.equal(mfaSetup.status, 200);
-    const totpCode = generateTotp(mfaSetup.body.secret);
-    const mfaEnable = await fetchB('/auth/mfa/enable', 'POST', { totp_code: totpCode });
+    const stepBaseMs = Math.floor(Date.now() / 30_000) * 30_000;
+    const prevStepCode = generateTotp(mfaSetup.body.secret, stepBaseMs - 30_000);
+    const currentStepCode = generateTotp(mfaSetup.body.secret, stepBaseMs);
+    const nextStepCode = generateTotp(mfaSetup.body.secret, stepBaseMs + 30_000);
+    const mfaEnable = await fetchB('/auth/mfa/enable', 'POST', { totp_code: prevStepCode });
+    assert.equal(mfaEnable.status, 200);
     assert.equal(mfaEnable.body.mfa_enabled, true);
+    // Calling /auth/mfa/setup again once MFA is enabled must fail with 409 MFA_ALREADY_ENABLED
+    const mfaSetupAgain = await fetchB('/auth/mfa/setup', 'POST', {});
+    assert.equal(mfaSetupAgain.status, 409);
+    assert.equal(mfaSetupAgain.body.error.code, 'MFA_ALREADY_ENABLED');
     await fetchB('/auth/logout', 'POST', {});
     const loginNoOtp = await fetchB('/auth/login', 'POST', { username: 'b-owner', org_slug: 'acme-b', password: fixturePassword });
     assert.equal(loginNoOtp.status, 401);
     assert.equal(loginNoOtp.body.error.code, 'MFA_REQUIRED');
-    const loginWithOtp = await fetchB('/auth/login', 'POST', { username: 'b-owner', org_slug: 'acme-b', password: fixturePassword, totp_code: generateTotp(mfaSetup.body.secret) });
+    // Replaying the TOTP step already consumed by /mfa/enable must fail
+    const loginReplay = await fetchB('/auth/login', 'POST', { username: 'b-owner', org_slug: 'acme-b', password: fixturePassword, totp_code: prevStepCode });
+    assert.equal(loginReplay.status, 401);
+    assert.equal(loginReplay.body.error.code, 'INVALID_MFA');
+    const loginWithOtp = await fetchB('/auth/login', 'POST', { username: 'b-owner', org_slug: 'acme-b', password: fixturePassword, totp_code: currentStepCode });
     assert.equal(loginWithOtp.status, 200);
 
     // 5. Member invitation + accept
@@ -1856,22 +1888,50 @@ test('multi-org tenant isolation, invitations, password reset, TOTP MFA, KMS, DB
     });
     assert.equal(invAcceptRes.status, 201);
 
-    // 6. Password reset request -> recorded in outbound_notifications -> confirm rotates password
-    const resetReq = await fetch(`http://127.0.0.1:${basePort}/api/v1/auth/password-reset/request`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'b-rep', org_slug: 'acme-b' }),
+    // 6. Password reset request -> webhook receives token while outbound_notifications DB row redacts secrets -> confirm rotates password
+    let deliveredResetPayload = null;
+    const prevAllowPrivate = process.env.ALLOW_PRIVATE_CONNECTORS;
+    process.env.ALLOW_PRIVATE_CONNECTORS = '1';
+    const notifyServer = createServer((req, res) => {
+      const chunks = [];
+      req.on('data', c => chunks.push(c));
+      req.on('end', () => {
+        try { deliveredResetPayload = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch {}
+        res.statusCode = 200;
+        res.end('ok');
+      });
     });
-    assert.equal(resetReq.status, 202);
-    const notifRow = app.db.prepare("SELECT payload FROM outbound_notifications WHERE recipient='rep@acme.example' ORDER BY created_at DESC LIMIT 1").get();
-    const resetPayload = JSON.parse(notifRow.payload);
-    assert.ok(resetPayload.reset_token);
-    const confirmRes = await fetch(`http://127.0.0.1:${basePort}/api/v1/auth/password-reset/confirm`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: resetPayload.reset_token, new_password: 'NewRepPassword123!' }),
-    });
-    assert.equal(confirmRes.status, 200);
+    await new Promise(resolve => notifyServer.listen(0, '127.0.0.1', resolve));
+    try {
+      const hookPort = notifyServer.address().port;
+      // Re-login as b-owner using fresh next TOTP step to configure OUTBOUND_NOTIFY
+      await fetchB('/auth/logout', 'POST', {});
+      const reLogin = await fetchB('/auth/login', 'POST', { username: 'b-owner', org_slug: 'acme-b', password: fixturePassword, totp_code: nextStepCode });
+      assert.equal(reLogin.status, 200);
+      const putNotify = await fetchB('/connectors/OUTBOUND_NOTIFY', 'PUT', { endpoint_url: `http://127.0.0.1:${hookPort}/notify`, enabled: true });
+      assert.equal(putNotify.status, 200);
+
+      const resetReq = await fetch(`http://127.0.0.1:${basePort}/api/v1/auth/password-reset/request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'b-rep', org_slug: 'acme-b' }),
+      });
+      assert.equal(resetReq.status, 202);
+      const notifRow = app.db.prepare("SELECT payload FROM outbound_notifications WHERE recipient='rep@acme.example' ORDER BY created_at DESC LIMIT 1").get();
+      const storedPayload = JSON.parse(notifRow.payload);
+      assert.equal(storedPayload.reset_token, '[REDACTED]');
+      assert.ok(deliveredResetPayload?.payload?.reset_token);
+      const confirmRes = await fetch(`http://127.0.0.1:${basePort}/api/v1/auth/password-reset/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: deliveredResetPayload.payload.reset_token, new_password: 'NewRepPassword123!' }),
+      });
+      assert.equal(confirmRes.status, 200);
+    } finally {
+      await new Promise(resolve => notifyServer.close(resolve));
+      if (prevAllowPrivate === undefined) delete process.env.ALLOW_PRIVATE_CONNECTORS;
+      else process.env.ALLOW_PRIVATE_CONNECTORS = prevAllowPrivate;
+    }
 
     // 7. DB-backed persistent login rate limit survives server restart
     for (let i = 0; i < 9; i++) {
@@ -2139,6 +2199,418 @@ test('opportunities and follow-up tasks default clean assignees without LOCAL_OW
     });
     assert.equal(badReassign.status, 422);
   } finally {
+    await app.close();
+  }
+});
+
+test('landing page routes /, /welcome, /app and /landing.js serve HTML/JS assets cleanly', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'botein-landing-'));
+  const app = await runApp(join(dir, 'botein.sqlite'), { authenticate: false });
+  try {
+    const home = await fetch(`${app.base}/`);
+    assert.equal(home.status, 200);
+    assert.match(home.headers.get('content-type') || '', /text\/html/);
+    const html = await home.text();
+    assert.match(html, /id="landing-screen"/);
+    assert.match(html, /id="auth-screen"/);
+    assert.match(html, /data-specimen-tab="draft"/);
+
+    const welcomeRoute = await fetch(`${app.base}/welcome`);
+    assert.equal(welcomeRoute.status, 200);
+    assert.match(welcomeRoute.headers.get('content-type') || '', /text\/html/);
+    assert.match(await welcomeRoute.text(), /id="landing-screen"/);
+
+    const appRoute = await fetch(`${app.base}/app`);
+    assert.equal(appRoute.status, 200);
+    assert.match(appRoute.headers.get('content-type') || '', /text\/html/);
+    assert.match(await appRoute.text(), /id="landing-screen"/);
+
+    const landingScript = await fetch(`${app.base}/landing.js`);
+    assert.equal(landingScript.status, 200);
+    assert.match(landingScript.headers.get('content-type') || '', /text\/javascript/);
+    assert.match(await landingScript.text(), /export function setupLanding/);
+  } finally {
+    await app.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('KMS production guard, nested SQLite SAVEPOINT, connector SSRF & payload redaction', async () => {
+  const envKeys = ['KMS_MASTER_KEY', 'BOTEIN_KMS_KEY', 'CONNECTOR_ENCRYPTION_KEY', 'KMS_ENDPOINT_URL', 'ENFORCE_KMS_KEY'];
+  const savedEnv = Object.fromEntries(envKeys.map(k => [k, process.env[k]]));
+  const app = await runApp(':memory:');
+  try {
+    // 1. Production KMS fail-fast + env var aliases
+    for (const k of envKeys) delete process.env[k];
+    process.env.ENFORCE_KMS_KEY = '1';
+    assert.equal(isKmsProductionEnforced(), true);
+    assert.throws(() => assertKmsConfigured(), /KMS_MASTER_KEY/);
+    assert.throws(() => sealSecret('abc'), /KMS_MASTER_KEY/);
+    process.env.BOTEIN_KMS_KEY = 'alias-kms-key-32-bytes-ok!!!!!!';
+    assert.doesNotThrow(() => assertKmsConfigured());
+    assert.equal(unsealSecret(sealSecret('hello-kms')), 'hello-kms');
+
+    // 2. verifyTotpStep monotonic replay check
+    const secret = 'JBSWY3DPEHPK3PXP';
+    const baseMs = 1_700_000_100_000;
+    const step = Math.floor(baseMs / 1000 / 30);
+    const code = generateTotp(secret, baseMs);
+    assert.deepEqual(verifyTotpStep(secret, code, baseMs, 1, -1), { valid: true, step });
+    assert.deepEqual(verifyTotpStep(secret, code, baseMs, 1, step), { valid: false, step: -1 });
+
+    // 3. Re-entrant transaction SAVEPOINT isolation
+    const orgId = app.db.prepare('SELECT id FROM organizations LIMIT 1').get().id;
+    const outerResult = transaction(app.db, () => {
+      app.db.prepare("INSERT INTO accounts (id,organization_id,brand_name,normalized_name,website,normalized_domain,headquarters_country,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?)")
+        .run('acc-save-outer', orgId, 'Outer Brand', 'outer brand', 'https://outer.example.com', 'outer.example.com', '', '', new Date().toISOString());
+      assert.throws(() => transaction(app.db, () => {
+        app.db.prepare("INSERT INTO accounts (id,organization_id,brand_name,normalized_name,website,normalized_domain,headquarters_country,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?)")
+          .run('acc-save-inner', orgId, 'Inner Brand', 'inner brand', 'https://inner.example.com', 'inner.example.com', '', '', new Date().toISOString());
+        throw new Error('inner_abort');
+      }), /inner_abort/);
+      return {
+        outerExists: Boolean(app.db.prepare('SELECT 1 FROM accounts WHERE id=?').get('acc-save-outer')),
+        innerExists: Boolean(app.db.prepare('SELECT 1 FROM accounts WHERE id=?').get('acc-save-inner')),
+      };
+    });
+    assert.deepEqual(outerResult, { outerExists: true, innerExists: false });
+    assert.ok(app.db.prepare('SELECT 1 FROM accounts WHERE id=?').get('acc-save-outer'));
+    assert.equal(app.db.prepare('SELECT 1 FROM accounts WHERE id=?').get('acc-save-inner'), undefined);
+
+    // 4. Connector SSRF guard & outbound payload secret redaction
+    assert.throws(() => connectorUrl('http://127.0.0.1:8080/hook', { allowPrivate: false }), /CONNECTOR_URL_BLOCKED|本机/);
+    assert.throws(() => connectorUrl('http://169.254.169.254/latest/meta-data', { allowPrivate: false }), /CONNECTOR_URL_BLOCKED|保留/);
+    await assert.rejects(() => safeExternalFetch('http://127.0.0.1:9999/hook', { allowPrivate: false }), /本机|内网|CONNECTOR_URL_BLOCKED/);
+    assert.deepEqual(redactSensitivePayload({
+      username: 'rep', reset_token: 'rt-secret', invite_token: 'it-secret', nested: { api_key: 'ak', token: 'tok', ok: 'yes' },
+    }), {
+      username: 'rep', reset_token: '[REDACTED]', invite_token: '[REDACTED]', nested: { api_key: '[REDACTED]', token: '[REDACTED]', ok: 'yes' },
+    });
+  } finally {
+    for (const k of envKeys) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+    await app.close();
+  }
+});
+
+test('auth Bearer token, ambiguous cross-org login, TRUST_PROXY rate limit & complete OWNER RBAC guards', async () => {
+  const prevTrustProxy = process.env.TRUST_PROXY;
+  process.env.TRUST_PROXY = '1';
+  const app = await runApp(':memory:');
+  try {
+    // 1. Register a second org with an owner sharing username "shared-user" across both orgs
+    const memberRes = await app.request('/auth/members', 'POST', {
+      username: 'shared-user', display_name: 'Org1 Shared', password: 'SharedPassword123!', role: 'MEMBER',
+    });
+    assert.equal(memberRes.status, 201);
+    const regB = await fetch(`${app.base}/api/v1/auth/organizations/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        org_name: 'Second Org', org_slug: 'second-org',
+        username: 'shared-user', display_name: 'Org2 Shared', email: 'shared@second.example', password: 'SharedPassword123!',
+      }),
+    });
+    assert.equal(regB.status, 201);
+
+    // Ambiguous username without org_slug must fail cleanly on /login and /password-reset/request
+    const ambigLogin = await fetch(`${app.base}/api/v1/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-forwarded-for': '203.0.113.10' },
+      body: JSON.stringify({ username: 'shared-user', password: 'SharedPassword123!' }),
+    });
+    assert.equal(ambigLogin.status, 400);
+    const ambigJson = await ambigLogin.json();
+    assert.equal(ambigJson.error.code, 'AMBIGUOUS_ORGANIZATION');
+    assert.equal(ambigJson.error.field, 'org_slug');
+
+    const ambigReset = await fetch(`${app.base}/api/v1/auth/password-reset/request`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'shared-user' }),
+    });
+    assert.equal(ambigReset.status, 400);
+    assert.equal((await ambigReset.json()).error.code, 'AMBIGUOUS_ORGANIZATION');
+
+    // Disambiguated login with org_slug + issue_bearer_token returns usable Bearer token
+    const bearerLogin = await fetch(`${app.base}/api/v1/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-forwarded-for': '203.0.113.11' },
+      body: JSON.stringify({ username: 'shared-user', org_slug: 'local-lancco', password: 'SharedPassword123!', issue_bearer_token: true }),
+    });
+    assert.equal(bearerLogin.status, 200);
+    const bearerData = await bearerLogin.json();
+    assert.ok(bearerData.token);
+
+    const memberReq = async (path, method = 'GET', body) => {
+      const res = await fetch(`${app.base}/api/v1${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${bearerData.token}`,
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: res.status, body: await res.json() };
+    };
+    const statusAsMember = await memberReq('/auth/status');
+    assert.equal(statusAsMember.status, 200);
+    assert.equal(statusAsMember.body.authenticated, true);
+    assert.equal(statusAsMember.body.user.role, 'MEMBER');
+
+    // TRUST_PROXY isolated rate-limit buckets by X-Forwarded-For
+    for (let i = 0; i < 10; i++) {
+      await fetch(`${app.base}/api/v1/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-forwarded-for': '198.51.100.1' },
+        body: JSON.stringify({ username: 'no-such-user', password: 'bad-password-1' }),
+      });
+    }
+    const blockedIp = await fetch(`${app.base}/api/v1/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-forwarded-for': '198.51.100.1' },
+      body: JSON.stringify({ username: 'no-such-user', password: 'bad-password-1' }),
+    });
+    assert.equal(blockedIp.status, 429);
+    const freshIp = await fetch(`${app.base}/api/v1/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-forwarded-for': '198.51.100.2' },
+      body: JSON.stringify({ username: 'no-such-user', password: 'bad-password-1' }),
+    });
+    assert.equal(freshIp.status, 401);
+
+    // 2. OWNER-only RBAC guards & domain integrity checks (QUALIFY blocks NOT_FIT / EXPIRED, Drafts block claims: [])
+    const { brand, proof, item, qualify } = await prepareOpportunity(app);
+    const facCur = (await app.request('/workspace')).body.factory;
+    const facMoq = (await app.request('/factory-profile', 'PUT', {
+      ...facCur, moq_quantity: 1000, unit: 'POD', packaging_spec: 'Custom film', lead_time_days: 30, expected_version: facCur.version,
+    })).body;
+    await app.request('/factory-profile/activate', 'POST', { expected_version: facMoq.version, confirmed: true });
+    const person = (await app.request('/contacts', 'POST', {
+      account_id: brand.id, full_name: 'Buyer Lead', email: 'buyer-rbac@example.com', source_url: 'https://example.com/team',
+    })).body;
+    await app.request(`/contacts/${person.id}/verify`, 'POST', { expected_version: person.version, reason: '核对公开联系通道', confirmed: true });
+    assert.equal((await memberReq('/factory-profile/checks', 'POST', {
+      expected_version: facMoq.version, field: 'service_type', reason: '成员越权核验工厂能力。', confirmed: true,
+    })).status, 403);
+    assert.equal((await memberReq('/account-identity-reviews/fake-review-id/resolve', 'POST', { decision: 'CREATE_NEW', reason: 'test' })).status, 403);
+
+    // Cannot qualify if opportunity is NOT_FIT
+    const notFitOpp = (await app.request(`/opportunities/${item.id}/fit`, 'PATCH', {
+      expected_version: (await app.request(`/opportunities/${item.id}`)).body.version, estimated_order_quantity: 5,
+    })).body;
+    assert.equal(notFitOpp.fit_status, 'NOT_FIT');
+    assert.equal((await app.request(`/opportunities/${item.id}/transitions`, 'POST', {
+      ...qualify, expected_version: notFitOpp.version,
+    })).status, 422);
+
+    // Fix order quantity so opportunity is no longer NOT_FIT, verify evidence, qualify, test REOPEN & VOID RBAC (MEMBER=403, OWNER=200), and reject empty claims
+    const fitOpp = (await app.request(`/opportunities/${item.id}/fit`, 'PATCH', {
+      expected_version: notFitOpp.version, estimated_order_quantity: 5000,
+    })).body;
+    await app.request(`/evidence/${proof.id}/verify`, 'POST', { expected_version: proof.version, reason: '核对原文', confirmed: true });
+    const qualRes = await app.request(`/opportunities/${item.id}/transitions`, 'POST', { ...qualify, expected_version: fitOpp.version });
+    assert.equal(qualRes.status, 200, JSON.stringify(qualRes.body));
+    assert.equal((await app.request(`/opportunities/${item.id}/drafts`, 'POST', {
+      contact_id: person.id, subject: 'Hello', body: 'World', claims: [],
+    })).status, 422);
+
+    const actRes = await app.request(`/opportunities/${item.id}/activities`, 'POST', {
+      activity_type: 'EMAIL_SENT', expected_version: qualRes.body.version, contact_id: person.id,
+      occurred_at: new Date().toISOString(), notes: 'Sent.', sent_confirmed: true, idempotency_key: randomUUID(),
+    });
+    assert.equal(actRes.status, 201);
+    const aid = actRes.body.id;
+    const postActVersion = (await app.request(`/opportunities/${item.id}`)).body.version;
+    assert.equal((await memberReq(`/opportunities/${item.id}/activities/${aid}/void`, 'POST', { expected_version: postActVersion, reason: '成员无权作废' })).status, 403);
+    assert.equal((await app.request(`/opportunities/${item.id}/activities/${aid}/void`, 'POST', { expected_version: postActVersion, reason: '负责人作废误录' })).status, 200);
+
+    // Test REOPEN RBAC (MEMBER=403, OWNER=200) on a REJECTED opportunity
+    const brandRej = (await app.request('/accounts', 'POST', { brand_name: 'RejBrand', website: 'https://rejbrand.example.com' })).body;
+    let oppRej = (await app.request('/opportunities', 'POST', { account_id: brandRej.id, reason: '待核查适配' })).body;
+    oppRej = (await app.request(`/opportunities/${oppRej.id}/transitions`, 'POST', {
+      expected_version: oppRej.version, action: 'START_REVIEW', reason: '进入复核',
+    })).body;
+    const rejRes = await app.request(`/opportunities/${oppRej.id}/transitions`, 'POST', {
+      expected_version: oppRej.version, action: 'REJECT', reason: '暂无匹配产能。',
+    });
+    assert.equal(rejRes.status, 200);
+    assert.equal((await memberReq(`/opportunities/${oppRej.id}/transitions`, 'POST', {
+      expected_version: rejRes.body.version, action: 'REOPEN', reason: '成员无权重开',
+    })).status, 403);
+    assert.equal((await app.request(`/opportunities/${oppRej.id}/transitions`, 'POST', {
+      expected_version: rejRes.body.version, action: 'REOPEN', reason: '负责人重新开启核查',
+    })).status, 200);
+  } finally {
+    if (prevTrustProxy === undefined) delete process.env.TRUST_PROXY;
+    else process.env.TRUST_PROXY = prevTrustProxy;
+    await app.close();
+  }
+});
+
+test('DISCOVERY non-fabrication, atomic worker claim, PARTIAL budget status, attempt failures & funnel cohort_assignee', async () => {
+  let failCandidatePage = false;
+  const services = {
+    searchWeb: async () => (failCandidatePage
+      ? [
+          { url: 'https://cleanpods.example.com/about', title: 'CleanPods Home', content: 'Snippet text only.' },
+          { url: 'https://failpods.example.com/shop', title: 'FailPods Shop', content: 'Another brand snippet.' },
+        ]
+      : [
+          { url: 'https://cleanpods.example.com/about', title: 'CleanPods Home', content: 'Snippet text only.' },
+        ]),
+    searchStatus: async () => ({ configured: true, reachable: true, base: 'stub' }),
+    fetchPage: async (url) => {
+      if (failCandidatePage && url.includes('failpods.example.com')) {
+        throw new Error('simulated_discovery_page_failure');
+      }
+      return {
+        final_url: url,
+        status_code: 200,
+        content_type: 'text/html',
+        text: 'Direct brand website text for CleanPods without search snippets.',
+        byte_length: 90,
+        redirect_count: 0,
+        redirect_chain: [],
+        fetched_at: new Date().toISOString(),
+        truncated: false,
+        metadata: { title: 'CleanPods', site_name: 'CleanPods', description: '' },
+      };
+    },
+    completeJson: async ({ prompt }) => {
+      const textPrompt = String(prompt);
+      if (textPrompt.includes('Analyze the following public evidence')) {
+        return {
+          data: {
+            event_type: 'PRODUCT_LAUNCH', intent_signal: 'UNKNOWN', uncertainty: 'LOW',
+            observed_facts: [{ text: 'CleanPods site found.', references: [{ quote: 'Direct brand website text for CleanPods without search snippets.' }] }],
+            business_hypotheses: [], missing_information: [],
+          },
+          usage: { input_tokens: 50, output_tokens: 20, cost_usd: 0.005 }, model: 'stub-model',
+        };
+      }
+      if (textPrompt.includes('contacts')) {
+        return { data: { contacts: [] }, usage: { input_tokens: 10, output_tokens: 10, cost_usd: 0.001 }, model: 'stub-model' };
+      }
+      // Discovery screening deliberately omits headquarters_country & product_name to verify zero fabrication
+      const candidates = [{ domain: 'cleanpods.example.com', brand_name: 'CleanPods', is_brand: true, product_signal: 'YES', market_signal: 'YES', reason: 'Candidate', evidence_excerpt: 'Excerpt' }];
+      if (textPrompt.includes('failpods.example.com')) {
+        candidates.push({ domain: 'failpods.example.com', brand_name: 'FailPods', is_brand: true, product_signal: 'YES', market_signal: 'YES', reason: 'Candidate 2', evidence_excerpt: 'Another brand snippet.' });
+      }
+      return {
+        data: { candidates },
+        usage: { input_tokens: 60, output_tokens: 30, cost_usd: 0.002 }, model: 'stub-model',
+      };
+    },
+    modelConfig: () => ({ configured: true, name: 'stub-model' }),
+    searchBase: 'stub',
+  };
+
+  const prevWorkerMode = process.env.RESEARCH_WORKER_MODE;
+  process.env.RESEARCH_WORKER_MODE = 'external';
+  const app = await runApp(':memory:', { services });
+  try {
+    const p = (await app.request('/workspace')).body.factory;
+    const saved = (await app.request('/factory-profile', 'PUT', { ...p, target_markets: ['US'], expected_version: p.version })).body;
+    await app.request('/factory-profile/activate', 'POST', { expected_version: saved.version, confirmed: true });
+
+    // 1. Atomic claim, active DISCOVERY lock & attempt-scoped failure recording
+    failCandidatePage = true;
+    const jobRes = await app.request('/research-jobs', 'POST', {
+      market: 'US', quantity: 2, source_mode: 'DISCOVERY',
+      budget: { cost_usd: 0.05 },
+    });
+    assert.equal(jobRes.status, 202);
+    const claimed = claimNextResearchJob(app.db, 'worker-test-1', 60_000);
+    assert.ok(claimed);
+    assert.equal(claimed.status, 'RUNNING');
+    assert.equal(claimed.worker_id, 'worker-test-1');
+
+    // Second concurrent claim for another DISCOVERY job is blocked while first DISCOVERY job is RUNNING
+    const job2Res = await app.request('/research-jobs', 'POST', { market: 'US', quantity: 1, source_mode: 'DISCOVERY' });
+    assert.equal(job2Res.status, 409);
+
+    // Run worker tick on claimed job
+    app.db.prepare("UPDATE research_jobs SET status='QUEUED', worker_id=NULL, lease_expires_at=NULL WHERE id=?").run(claimed.id);
+    await runWorkerTick(app.db, services, { workerId: 'worker-test-2' });
+
+    const jobAfterAttempt1 = (await app.request(`/research-jobs/${claimed.id}`)).body;
+    assert.equal(jobAfterAttempt1.status, 'PARTIAL');
+    const fails1 = (await app.request(`/research-jobs/${claimed.id}/failures?attempt=1`)).body;
+    assert.equal(fails1.items.length, 1);
+    assert.equal(fails1.items[0].attempt, 1);
+    assert.equal((await app.request(`/research-jobs/${claimed.id}/failures?attempt=2`)).body.items.length, 0);
+
+    // Verify non-fabrication on CleanPods: headquarters_country === '', no fabricated product, raw_text clean from search snippet pollution
+    const cleanAccount = (await app.request('/accounts?q=CleanPods')).body.items[0];
+    assert.equal(cleanAccount.headquarters_country, '');
+    const cleanProducts = (await app.request(`/accounts/${cleanAccount.id}/products`)).body.items;
+    assert.equal(cleanProducts.length, 0);
+    const cleanEvidence = (await app.request(`/evidence?account_id=${cleanAccount.id}`)).body.items[0];
+    assert.equal(cleanEvidence.source_kind, 'FIRST_PARTY_BRAND');
+    assert.ok(!cleanEvidence.raw_text.includes('Snippet text only'));
+
+    // 2. Budget exhaustion in enrichment sets job status = PARTIAL (not COMPLETED)
+    failCandidatePage = false;
+    const budgetApp = await runApp(':memory:', { services });
+    try {
+      const bp = (await budgetApp.request('/workspace')).body.factory;
+      const bSaved = (await budgetApp.request('/factory-profile', 'PUT', { ...bp, target_markets: ['US'], expected_version: bp.version })).body;
+      await budgetApp.request('/factory-profile/activate', 'POST', { expected_version: bSaved.version, confirmed: true });
+      const tightBudgetJob = (await budgetApp.request('/research-jobs', 'POST', {
+        market: 'US', quantity: 1, source_mode: 'DISCOVERY',
+        budget: { cost_usd: 0.004 },
+      })).body;
+      await runWorkerTick(budgetApp.db, services, { workerId: 'worker-budget' });
+      const tightJob = (await budgetApp.request(`/research-jobs/${tightBudgetJob.id}`)).body;
+      assert.equal(tightJob.status, 'PARTIAL');
+      assert.equal(tightJob.stop_reason, 'BUDGET_EXHAUSTED');
+
+      // 3. Funnel cohort_assignee stability, first_decision history, research_job_id filter & operations metrics
+      await budgetApp.request('/auth/members', 'POST', {
+        username: 'cohort-rep', display_name: 'Cohort Rep', password: 'member-pass-12345', role: 'MEMBER',
+      });
+      await budgetApp.request('/auth/members', 'POST', {
+        username: 'new-assignee', display_name: 'New Assignee', password: 'member-pass-12345', role: 'MEMBER',
+      });
+      const { item: funnelOpp, proof: evF, qualify: funnelQualify } = await prepareOpportunity(budgetApp);
+      await budgetApp.request(`/opportunities/${funnelOpp.id}/assign`, 'PATCH', { expected_version: funnelOpp.version, assigned_to: 'cohort-rep' });
+      // Verify evidence & qualify while cohort-rep owns it -> cohort_assignee stays cohort-rep and first_decision='QUALIFY'
+      await budgetApp.request(`/evidence/${evF.id}/verify`, 'POST', { expected_version: evF.version, reason: '核对', confirmed: true });
+      const latestOpp = (await budgetApp.request(`/opportunities/${funnelOpp.id}`)).body;
+      const qRes = await budgetApp.request(`/opportunities/${funnelOpp.id}/transitions`, 'POST', {
+        ...funnelQualify, expected_version: latestOpp.version,
+      });
+      assert.equal(qRes.status, 200, JSON.stringify(qRes.body));
+      // Reassign to new-assignee & force reassessment
+      await budgetApp.request(`/opportunities/${funnelOpp.id}/assign`, 'PATCH', {
+        expected_version: (await budgetApp.request(`/opportunities/${funnelOpp.id}`)).body.version, assigned_to: 'new-assignee',
+      });
+      const evCur = (await budgetApp.request('/evidence')).body.items.find(e => e.id === evF.id);
+      await budgetApp.request(`/evidence/${evF.id}/invalidate`, 'POST', {
+        expected_version: evCur.version, reason: '复核需要重新评估',
+      });
+      const funnelCohort = (await budgetApp.request('/analytics/funnel?assigned_to=cohort-rep')).body;
+      assert.equal(funnelCohort.metrics.candidates, 1);
+      assert.equal(funnelCohort.metrics.qualified, 1); // first_decision QUALIFY remains attributed even after REASSESSMENT_REQUIRED
+      assert.equal(funnelCohort.current.reassessment_required, 1);
+      assert.equal(funnelCohort.breakdowns.by_assignee[0].assigned_to, 'cohort-rep');
+      assert.equal(funnelCohort.breakdowns.by_assignee[0].qualified, 1);
+      assert.ok(funnelCohort.operations && typeof funnelCohort.operations.research_jobs === 'number');
+      const allFunnel = (await budgetApp.request('/analytics/funnel')).body;
+      assert.equal(allFunnel.metrics.candidates, 2);
+      const jobFilteredFunnel = (await budgetApp.request(`/analytics/funnel?research_job_id=${tightBudgetJob.id}`)).body;
+      assert.equal(jobFilteredFunnel.metrics.candidates, 1);
+      const emptyJobFunnel = (await budgetApp.request('/analytics/funnel?research_job_id=nonexistent-job-id')).body;
+      assert.equal(emptyJobFunnel.metrics.candidates, 0);
+    } finally {
+      await budgetApp.close();
+    }
+  } finally {
+    if (prevWorkerMode === undefined) delete process.env.RESEARCH_WORKER_MODE;
+    else process.env.RESEARCH_WORKER_MODE = prevWorkerMode;
     await app.close();
   }
 });

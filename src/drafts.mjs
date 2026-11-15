@@ -60,17 +60,19 @@ function checks(db, draft, approving = false, orgId = ORG) {
   if (['WON', 'LOST'].includes(item.sales_stage)) add('商机已成交或丢单，不批准新的开发信。');
   if (factory.status !== 'ACTIVE' || item.factory_version !== factory.version) add('工厂档案或商机匹配版本已变化，请重新核对。');
   const qualification = db.prepare("SELECT id FROM opportunity_history WHERE organization_id=? AND opportunity_id=? AND action='QUALIFY' ORDER BY created_at DESC,rowid DESC LIMIT 1").get(orgId, item.id);
-  const refs = db.prepare('SELECT oe.*, e.version AS live_version, e.verification_status, e.checked_at FROM opportunity_evidence oe JOIN evidence e ON e.id=oe.evidence_id AND e.organization_id=oe.organization_id WHERE oe.opportunity_id=? AND oe.organization_id=?').all(item.id, orgId);
+  const refs = db.prepare('SELECT oe.*, e.version AS live_version, e.verification_status, e.availability_status, e.checked_at FROM opportunity_evidence oe JOIN evidence e ON e.id=oe.evidence_id AND e.organization_id=oe.organization_id WHERE oe.opportunity_id=? AND oe.organization_id=?').all(item.id, orgId);
   if (!refs.some(r => r.role === 'MARKET')) add('缺少商机的目标市场在售依据。');
   for (const ref of refs) {
-    if (ref.verification_status !== 'VERIFIED') add('商机资格引用的证据已失效。', true);
+    if (ref.verification_status !== 'VERIFIED' || ref.availability_status === 'EXPIRED') add('商机资格引用的证据已失效。', true);
+    if (ref.live_version !== ref.evidence_version) add('商机资格引用的证据版本已变化，请重新审核。');
     if (ref.role === 'MARKET' && (!ref.checked_at || Date.now() - Date.parse(ref.checked_at) > 7 * 86400000)) add('目标市场在售核验已超过 7 天，请重新核验并审核。');
   }
+  if (!draft.claims.length) add('草稿至少需要绑定 1 条事实陈述，不能无事实依据批准外发。', true);
   const claims = draft.claims.map(claim => {
     let valid = true;
     if (claim.kind === 'EVIDENCE') {
       const e = db.prepare('SELECT * FROM evidence WHERE id=? AND organization_id=? AND account_id=?').get(claim.evidence_id, orgId, item.account_id);
-      if (!e || e.verification_status !== 'VERIFIED') { valid = false; add('事实陈述引用的证据未核验或已失效。', true); }
+      if (!e || e.verification_status !== 'VERIFIED' || e.availability_status === 'EXPIRED') { valid = false; add('事实陈述引用的证据未核验或已失效。', true); }
       else {
         if (e.product_id) {
           const prod = db.prepare('SELECT status, product_category FROM account_products WHERE id=? AND organization_id=? AND account_id=?')
@@ -212,7 +214,7 @@ function draftInput(db, body, opportunityId, orgId = ORG) {
   requireValue(!person.suppression_reason, '该联系渠道已禁止联系，不创建触达草稿。', 'contact_id');
   const subject = text(body.subject, 'subject', 200), message = text(body.body, 'body', 10000);
   requireValue(!/[\r\n]/.test(subject), '主题请使用单行文本。', 'subject');
-  requireValue(Array.isArray(body.claims) && body.claims.length <= 30, '事实陈述最多 30 条。', 'claims');
+  requireValue(Array.isArray(body.claims) && body.claims.length >= 1 && body.claims.length <= 30, '草稿至少需要绑定 1 条且不超过 30 条事实陈述。', 'claims');
   const claims = body.claims.map(c => {
     requireValue(c && typeof c === 'object', '事实陈述格式有误。', 'claims');
     const claimText = text(c.text, 'claims', 2000);
@@ -384,7 +386,7 @@ ${factoryBlock}`;
       model: modelVersion, prompt_version: DRAFT_PROMPT_VERSION, usage, claims: claims.length,
     }, 'AI', ctx);
   });
-  return { status: 201, body: { ...draft, generated: true, model: modelVersion, prompt_version: DRAFT_PROMPT_VERSION } };
+  return { status: 201, body: { ...draft, generated: true, model: modelVersion, prompt_version: DRAFT_PROMPT_VERSION }, usage };
 }
 
 export function draftsApi(db, path, method, body, query, ctx = null) {
@@ -457,6 +459,7 @@ export function draftsApi(db, path, method, body, query, ctx = null) {
       db.prepare('INSERT INTO draft_versions (id,organization_id,draft_id,number,contact_id,subject,body,claims,status,approval_snapshot,created_at,contact_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
         .run(versionId, orgId, current.id, current.number + 1, input.contact_id, input.subject, input.body, JSON.stringify(input.claims), 'IN_REVIEW', null, new Date().toISOString(), JSON.stringify(input.contact_snapshot));
       db.prepare('UPDATE drafts SET current_version_id=?, version=version+1 WHERE id=? AND organization_id=?').run(versionId, current.id, orgId);
+      audit(db, 'DRAFT_UPDATED', current.id, { from_version_id: current.current_version_id, to_version_id: versionId, number: current.number + 1 }, ctx);
       reviewLog(db, current.current_version_id, 'SUPERSEDED', '编辑产生新版本，旧批准不继承。', {}, ctx);
       return { status: 200, body: draftDetail(db, current.id, ctx) };
     });

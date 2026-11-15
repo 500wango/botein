@@ -72,25 +72,31 @@ ${pages.map(pageBlock).join('\n\n---\n\n')}
 </untrusted_discovery_pages>`;
 }
 
-function evidenceText(entry, excerpt) {
+function evidenceText(entry, sourceKind) {
   const metadata = entry.page.metadata ?? {};
-  return [
+  const lines = [
     '自动发现候选（未经人工核验）',
-    `来源性质：FIRST_PARTY_BRAND（抓取 URL：${entry.page.final_url || entry.landingUrl}）`,
-    `搜索标题：${clip(entry.result.title, 300)}`,
-    `搜索摘要：${clip(entry.result.content, 1000)}`,
-    `页面标题：${clip(metadata.title, 300)}`,
-    `站点名称：${clip(metadata.site_name, 200)}`,
-    `页面描述：${clip(metadata.description, 500)}`,
-    `页面摘录：${clip(entry.page.text, 1500)}`,
-    `模型摘录：${clip(excerpt, 500)}`,
-  ].join('\n').slice(0, 20000);
+    `来源性质：${sourceKind}（抓取 URL：${entry.page.final_url || entry.landingUrl}）`,
+  ];
+  if (sourceKind === 'FIRST_PARTY_BRAND') {
+    if (metadata.title) lines.push(`页面标题：${clip(metadata.title, 300)}`);
+    if (metadata.site_name) lines.push(`站点名称：${clip(metadata.site_name, 200)}`);
+    if (metadata.description) lines.push(`页面描述：${clip(metadata.description, 500)}`);
+    lines.push(`页面正文：${clip(entry.page.text, 15000)}`);
+  } else {
+    if (entry.result.title) lines.push(`搜索标题：${clip(entry.result.title, 300)}`);
+    if (entry.result.content) lines.push(`搜索摘要：${clip(entry.result.content, 1000)}`);
+    if (metadata.title) lines.push(`页面标题：${clip(metadata.title, 300)}`);
+    if (metadata.description) lines.push(`页面描述：${clip(metadata.description, 500)}`);
+    if (entry.page.text) lines.push(`页面正文：${clip(entry.page.text, 1500)}`);
+  }
+  return lines.join('\n').slice(0, 20000);
 }
 
 function ensureCandidateProduct(db, orgId, accountId, { productName, productCategory, productUrl, marketplace, packagingType }) {
   const cleanName = clip(productName, 120).trim();
   const cleanUrl = String(productUrl || '').trim();
-  if (!cleanUrl) return null;
+  if (!cleanUrl || !cleanName) return null;
   let normalizedUrl = cleanUrl;
   try {
     const u = new URL(cleanUrl);
@@ -106,9 +112,9 @@ function ensureCandidateProduct(db, orgId, accountId, { productName, productCate
     VALUES (?,?,?,?,?,?,?,'',?,?,?,'ACTIVE',1,?,?)`)
     .run(
       id, orgId, accountId,
-      cleanName || `${PRODUCT_CATEGORIES[productCategory]?.label || productCategory} 候选产品`,
-      productCategory, cleanUrl, normalizedUrl, marketplace || 'US',
-      clip(packagingType, 80).trim(), '自动发现写入候选产品，待人工确认产品规格与归属。', now, now,
+      cleanName,
+      productCategory, cleanUrl, normalizedUrl, marketplace || '',
+      clip(packagingType, 80).trim(), '自动发现从页面提取的候选产品，待人工确认产品规格与归属。', now, now,
     );
   return { id, version: 1, created: true };
 }
@@ -318,9 +324,7 @@ export async function discover({
     const rawCat = String(item.product_category || '').toUpperCase();
     const targetCategory = allowedCategories.has(rawCat) ? rawCat : (input.product_categories?.[0] || 'LAUNDRY_PODS');
     const modelProductName = String(item.product_name ?? '').trim();
-    const groundedProductName = modelProductName && supplied.includes(normalize(modelProductName))
-      ? modelProductName
-      : `${brandName} ${PRODUCT_CATEGORIES[targetCategory]?.label || targetCategory}`;
+    const hasGroundedProduct = Boolean(modelProductName && supplied.includes(normalize(modelProductName)));
     const modelPkg = String(item.packaging_type ?? '').trim();
     const groundedPkg = modelPkg && supplied.includes(normalize(modelPkg)) ? modelPkg : '';
 
@@ -330,25 +334,33 @@ export async function discover({
         const account = addAccount(db, accountInput({
           brand_name: brandName,
           website: entry.homepageUrl,
-          headquarters_country: (input.market || 'US') === 'US' ? 'US' : '',
+          headquarters_country: '',
           notes: '自动发现候选；品牌身份、产品与目标市场在售情况需人工核验。',
         }), ctx);
         if (account.status === 'NEEDS_REVIEW') return { review: account };
         const evidenceUrl = entry.page.final_url || entry.landingUrl;
-        const product = ensureCandidateProduct(db, orgId, account.id, {
-          productName: groundedProductName,
-          productCategory: targetCategory,
-          productUrl: evidenceUrl,
-          marketplace: input.market || 'US',
-          packagingType: groundedPkg,
-        });
+        let evHost = entry.host;
+        try { evHost = new URL(evidenceUrl).hostname.toLowerCase().replace(/^www\./, ''); } catch {}
+        const hasPageText = Boolean(entry.page?.text && entry.page.text.trim().length > 0);
+        const sourceKind = hasPageText && (evHost === entry.host || evHost.endsWith(`.${entry.host}`))
+          ? 'FIRST_PARTY_BRAND'
+          : 'SEARCH_SNIPPET';
+        const product = hasGroundedProduct
+          ? ensureCandidateProduct(db, orgId, account.id, {
+            productName: modelProductName,
+            productCategory: targetCategory,
+            productUrl: evidenceUrl,
+            marketplace: '',
+            packagingType: groundedPkg,
+          })
+          : null;
         const ev = addEvidence(db, {
           account_id: account.id,
           product_id: product?.id ?? null,
           source_url: evidenceUrl,
-          source_kind: 'FIRST_PARTY_BRAND',
-          availability_status: 'AVAILABLE',
-          raw_text: evidenceText(entry, verifiedExcerpt),
+          source_kind: sourceKind,
+          availability_status: hasPageText ? 'AVAILABLE' : 'UNKNOWN',
+          raw_text: evidenceText(entry, sourceKind),
         }, ctx);
         return {
           account_id: account.id,

@@ -16,7 +16,7 @@ npm start
 
 自动发现需要本地搜索与模型：先运行 `docker compose up -d` 启动 SearXNG，并配置模型网关环境变量；详见“模型与搜索接入”。如需独立后台队列与定时监控进程，可运行 `npm run worker`。
 
-默认 SQLite 数据库位于 `data/botein.sqlite`，启动时会自动完成 schema 迁移（当前 schema 版本 v17）。如需使用 PostgreSQL 实时运行时：
+默认 SQLite 数据库位于 `data/botein.sqlite`，启动时会自动完成 schema 迁移（当前 schema 版本 v18）。如需使用 PostgreSQL 实时运行时：
 
 ```bash
 DB_DRIVER=postgres DATABASE_URL=postgres://user:pass@localhost:5432/botein npm start
@@ -30,7 +30,7 @@ DB_DRIVER=postgres DATABASE_URL=postgres://user:pass@localhost:5432/botein npm r
 
 - 支持本地负责人首次初始化（`POST /api/v1/auth/setup`）、多工作区注册（`POST /api/v1/auth/organizations/register`，受 `ALLOW_MULTI_ORG_REGISTER` 控制）、工作区成员邀请（`OWNER` / `MEMBER` RBAC 隔离）、成员启用/停用、密码重置令牌流程以及双因素认证（TOTP MFA）。
 - 密码使用 Node scrypt（N=32768，r=8，p=1）和随机盐；Cookie 为随机 32 字节值，数据库只保存 SHA-256 会话摘要。Cookie 使用 `HttpOnly`、`SameSite=Strict`、`Path=/`，在 HTTPS 或反向代理（`TRUST_PROXY=1` + `X-Forwarded-Proto: https`）下自动附加 `Secure`。
-- 支持按环境变量配置 `HOST` / `PORT`、`PUBLIC_BASE_URL` / `TRUSTED_HOSTS`、`CORS_ALLOWED_ORIGINS`、持久化限流表（`rate_limit_events`）与信封加密（`KMS_MASTER_KEY` / `CONNECTOR_ENCRYPTION_KEY`）。
+- 支持按环境变量配置 `HOST` / `PORT`、`PUBLIC_BASE_URL` / `TRUSTED_HOSTS`、`CORS_ALLOWED_ORIGINS`、持久化限流表（`rate_limit_events`）与信封加密（`KMS_MASTER_KEY` / `BOTEIN_KMS_KEY` / `CONNECTOR_ENCRYPTION_KEY` / `KMS_ENDPOINT_URL`）。
 - 支持有效会话管理（`GET /api/v1/auth/sessions`、`POST /revoke`、`POST /revoke-others`）及独立凭据版本号撤销。
 
 ## 已实现核心能力

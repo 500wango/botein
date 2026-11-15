@@ -139,9 +139,10 @@ function funnel(db, query, ctx = null) {
   const filterAssigned = query.get('assigned_to')?.trim() || '';
   const filterCategory = query.get('product_category')?.trim() || '';
   const filterMarket = query.get('market')?.trim().toUpperCase() || 'ALL';
+  const filterJobId = query.get('research_job_id')?.trim() || '';
   let oppWhere = 'WHERE o.organization_id=? AND o.created_at>=? AND o.created_at<? AND o.created_at<=?';
   const oppParams = [orgId, start.toISOString(), endExclusive, asOf];
-  if (filterAssigned) { oppWhere += ' AND o.assigned_to=?'; oppParams.push(filterAssigned); }
+  if (filterAssigned) { oppWhere += " AND COALESCE(NULLIF(o.cohort_assignee, ''), o.assigned_to)=?"; oppParams.push(filterAssigned); }
   if (filterCategory) { oppWhere += ' AND o.product_category=?'; oppParams.push(filterCategory); }
   if (filterMarket && filterMarket !== 'ALL') {
     oppWhere += ` AND (EXISTS (
@@ -151,8 +152,16 @@ function funnel(db, query, ctx = null) {
     ))`;
     oppParams.push(filterMarket, filterMarket);
   }
+  if (filterJobId) {
+    oppWhere += ` AND EXISTS (
+      SELECT 1 FROM research_job_results rjr
+      WHERE rjr.organization_id=o.organization_id AND rjr.opportunity_id=o.id AND rjr.research_job_id=?
+    )`;
+    oppParams.push(filterJobId);
+  }
 
-  const rows = db.prepare(`SELECT o.id, o.qualification_status, o.assigned_to, o.product_category,
+  const rows = db.prepare(`SELECT o.id, o.qualification_status, o.assigned_to, o.cohort_assignee,
+    COALESCE(NULLIF(o.cohort_assignee, ''), o.assigned_to) AS effective_assignee, o.product_category,
     (SELECT h.action FROM opportunity_history h WHERE h.organization_id=o.organization_id AND h.opportunity_id=o.id
       AND h.action IN ('QUALIFY','REJECT') AND h.created_at<=? ORDER BY h.created_at, h.rowid LIMIT 1) AS first_decision
     FROM opportunities o ${oppWhere}`)
@@ -167,43 +176,64 @@ function funnel(db, query, ctx = null) {
   const oppIds = new Set(rows.map(r => r.id));
   const assigneeMap = new Map();
   for (const row of rows) {
-    const key = row.assigned_to || '';
+    const key = row.effective_assignee || '';
     if (!assigneeMap.has(key)) assigneeMap.set(key, { assigned_to: key, candidates: 0, qualified: 0, contacted: 0, won: 0 });
     const entry = assigneeMap.get(key);
     entry.candidates++;
-    if (row.qualification_status === 'QUALIFIED') entry.qualified++;
+    if (row.first_decision === 'QUALIFY') entry.qualified++;
   }
   const contactedSet = new Set(activities.filter(a => a.activity_type === 'EMAIL_SENT').map(a => a.opportunity_id));
   const wonSet = new Set(activities.filter(a => a.activity_type === 'DEAL_WON').map(a => a.opportunity_id));
   for (const row of rows) {
-    const entry = assigneeMap.get(row.assigned_to || '');
+    const entry = assigneeMap.get(row.effective_assignee || '');
     if (contactedSet.has(row.id)) entry.contacted++;
     if (wonSet.has(row.id)) entry.won++;
   }
 
   const jobRows = db.prepare(`SELECT r.research_job_id, j.source_mode, j.created_at, COUNT(DISTINCT r.opportunity_id) AS candidates,
-    SUM(CASE WHEN o.qualification_status='QUALIFIED' THEN 1 ELSE 0 END) AS qualified
+    SUM(CASE WHEN (SELECT h.action FROM opportunity_history h WHERE h.organization_id=o.organization_id AND h.opportunity_id=o.id
+      AND h.action IN ('QUALIFY','REJECT') AND h.created_at<=? ORDER BY h.created_at, h.rowid LIMIT 1)='QUALIFY' THEN 1 ELSE 0 END) AS qualified
     FROM research_job_results r
     JOIN research_jobs j ON j.id=r.research_job_id AND j.organization_id=r.organization_id
     JOIN opportunities o ON o.id=r.opportunity_id AND o.organization_id=r.organization_id
-    WHERE r.organization_id=? AND r.opportunity_id IS NOT NULL AND o.created_at>=? AND o.created_at<? AND o.created_at<=?
+    ${oppWhere} AND r.opportunity_id IS NOT NULL
     GROUP BY r.research_job_id, j.source_mode, j.created_at ORDER BY j.created_at DESC LIMIT 20`)
-    .all(orgId, start.toISOString(), endExclusive, asOf);
-  const rejectReasons = db.prepare(`SELECT reason, COUNT(*) AS count
-    FROM opportunity_history WHERE organization_id=? AND action='REJECT' AND created_at>=? AND created_at<? AND created_at<=?
-    GROUP BY reason ORDER BY count DESC LIMIT 10`).all(orgId, start.toISOString(), endExclusive, asOf);
-  const jobFailures = db.prepare(`SELECT step, COUNT(*) AS count
-    FROM research_job_failures WHERE organization_id=? AND created_at>=? AND created_at<? AND created_at<=?
-    GROUP BY step ORDER BY count DESC`).all(orgId, start.toISOString(), endExclusive, asOf);
+    .all(asOf, ...oppParams);
+  const rejectReasons = db.prepare(`SELECT h.reason, COUNT(*) AS count
+    FROM opportunity_history h
+    JOIN opportunities o ON o.id=h.opportunity_id AND o.organization_id=h.organization_id
+    ${oppWhere} AND h.action='REJECT' AND h.created_at>=? AND h.created_at<? AND h.created_at<=?
+    GROUP BY h.reason ORDER BY count DESC LIMIT 10`).all(...oppParams, start.toISOString(), endExclusive, asOf);
+  const failureSql = filterJobId
+    ? `SELECT step, COUNT(*) AS count FROM research_job_failures WHERE organization_id=? AND research_job_id=? AND created_at>=? AND created_at<? AND created_at<=? GROUP BY step ORDER BY count DESC`
+    : `SELECT step, COUNT(*) AS count FROM research_job_failures WHERE organization_id=? AND created_at>=? AND created_at<? AND created_at<=? GROUP BY step ORDER BY count DESC`;
+  const jobFailures = filterJobId
+    ? db.prepare(failureSql).all(orgId, filterJobId, start.toISOString(), endExclusive, asOf)
+    : db.prepare(failureSql).all(orgId, start.toISOString(), endExclusive, asOf);
+
+  const researchCounts = db.prepare(`SELECT count(*) AS total_jobs,
+    SUM(CASE WHEN status IN ('COMPLETED','PARTIAL') THEN 1 ELSE 0 END) AS finished_jobs
+    FROM research_jobs WHERE organization_id=? AND created_at>=? AND created_at<? AND created_at<=?`)
+    .get(orgId, start.toISOString(), endExclusive, asOf);
+  const evidenceCounts = db.prepare(`SELECT count(*) AS total_evidence,
+    SUM(CASE WHEN verification_status='VERIFIED' THEN 1 ELSE 0 END) AS verified_evidence
+    FROM evidence WHERE organization_id=? AND created_at>=? AND created_at<? AND created_at<=?`)
+    .get(orgId, start.toISOString(), endExclusive, asOf);
 
   return {
-    filters: { from, to, as_of: asOf, timezone: 'UTC', assigned_to: filterAssigned || 'ALL', product_category: filterCategory || 'ALL', market: filterMarket || 'ALL' },
+    filters: { from, to, as_of: asOf, timezone: 'UTC', assigned_to: filterAssigned || 'ALL', product_category: filterCategory || 'ALL', market: filterMarket || 'ALL', research_job_id: filterJobId || 'ALL' },
     generated_at: generated.toISOString(),
     metrics: {
       candidates: rows.length, reviewed, qualified, qualification_rate: reviewed ? qualified / reviewed : null,
       contacted: countActivity('EMAIL_SENT'), positive_replies: countActivity('REPLY_RECEIVED', 'POSITIVE'),
       meetings: countActivity('MEETING_SCHEDULED'), sample_requests: countActivity('SAMPLE_REQUESTED'),
       quotations: countActivity('QUOTATION_SENT'), won: countActivity('DEAL_WON'), lost: countActivity('DEAL_LOST'),
+    },
+    operations: {
+      research_jobs: Number(researchCounts?.total_jobs ?? 0) || 0,
+      finished_research_jobs: Number(researchCounts?.finished_jobs ?? 0) || 0,
+      evidence_total: Number(evidenceCounts?.total_evidence ?? 0) || 0,
+      evidence_verified: Number(evidenceCounts?.verified_evidence ?? 0) || 0,
     },
     current: {
       qualified: rows.filter(r => r.qualification_status === 'QUALIFIED').length,

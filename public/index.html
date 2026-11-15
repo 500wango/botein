@@ -14,8 +14,364 @@
 </head>
 <body class="vbg-report">
   <a class="sn-skip" href="#main">跳至主要内容</a>
-  <main id="auth-screen" tabindex="-1" class="sn-auth" aria-labelledby="auth-title">
-    <a class="sn-brand" href="/">Botein</a>
+  <div id="boot-screen" class="sn-boot" role="status" aria-live="polite">正在加载 Botein…</div>
+  <div id="landing-screen" class="sn-landing" tabindex="-1" hidden>
+    <div class="sn-lp-atmosphere" aria-hidden="true"></div>
+    <div class="sn-lp-island-wrap">
+      <header class="sn-lp-island">
+        <a class="sn-lp-logo" href="/">
+          <span class="sn-lp-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3.5" y="3.5" width="17" height="17" rx="5"></rect>
+              <path d="M8.5 15.5L15.5 8.5M10.5 8.5H15.5V13.5"></path>
+            </svg>
+          </span>
+          <span>Botein</span>
+        </a>
+        <nav class="sn-lp-nav" aria-label="产品介绍导航">
+          <a href="#landing-workflow">工作流</a>
+          <a href="#landing-guardrails">确认边界</a>
+          <a href="#landing-architecture">工程底座</a>
+        </nav>
+        <div class="sn-lp-header-actions">
+          <button class="sn-lp-text-btn" id="landing-nav-invite" type="button" data-enter-auth="accept_invite">接受邀请</button>
+          <button class="sn-lp-pill-ghost" id="landing-nav-login" type="button" data-enter-auth="login">登录</button>
+          <button class="sn-lp-pill-cta sn-lp-pill-cta-sm" id="landing-nav-register" type="button" data-enter-auth="register">
+            <span class="sn-lp-cta-label">创建工作区</span>
+            <span class="sn-lp-orb" aria-hidden="true">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 11.5L11.5 4.5M6 4.5H11.5V10"></path></svg>
+            </span>
+          </button>
+          <button class="sn-lp-burger" id="landing-menu-toggle" type="button" aria-expanded="false" aria-controls="landing-mobile-drawer" aria-label="展开导航菜单">
+            <span></span><span></span>
+          </button>
+        </div>
+      </header>
+    </div>
+
+    <div id="landing-mobile-drawer" class="sn-lp-drawer" aria-hidden="true" hidden>
+      <nav class="sn-lp-drawer-nav" aria-label="移动端导航">
+        <a href="#landing-workflow" data-drawer-item>五步研究工作流</a>
+        <a href="#landing-guardrails" data-drawer-item>自动化与人工边界</a>
+        <a href="#landing-architecture" data-drawer-item>安全与双引擎底座</a>
+        <div class="sn-lp-drawer-actions" data-drawer-item>
+          <button class="sn-lp-pill-cta" id="landing-drawer-cta" type="button" data-enter-auth="register">
+            <span class="sn-lp-cta-label">创建企业工作区</span>
+            <span class="sn-lp-orb" aria-hidden="true">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 11.5L11.5 4.5M6 4.5H11.5V10"></path></svg>
+            </span>
+          </button>
+          <button class="sn-lp-pill-ghost" id="landing-drawer-login" type="button" data-enter-auth="login">登录工作空间</button>
+        </div>
+      </nav>
+    </div>
+
+    <main class="sn-lp-main">
+      <section class="sn-lp-hero" aria-labelledby="lp-hero-title">
+        <div class="sn-lp-hero-copy">
+          <span class="sn-lp-eyebrow" data-hero-reveal style="--d:0ms">Botein · 外贸品牌智能开发工作台</span>
+          <h1 id="lp-hero-title" data-hero-reveal style="--d:80ms">把海外品牌线索<br>做成有出处的成交机会</h1>
+          <p class="sn-lp-lead" data-hero-reveal style="--d:160ms">面向 OEM/ODM 工厂与海外开发团队。选择目标市场并继承工厂能力档案，系统完成品牌发现、原文取证、硬约束匹配与引用级英文草稿——每句事实可追溯，每次发送由人拍板。</p>
+          <div class="sn-lp-cta-row" data-hero-reveal style="--d:240ms">
+            <button class="sn-lp-pill-cta" id="landing-primary-cta" type="button" data-enter-auth="register">
+              <span class="sn-lp-cta-label">创建企业工作区</span>
+              <span class="sn-lp-orb" aria-hidden="true">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 11.5L11.5 4.5M6 4.5H11.5V10"></path></svg>
+              </span>
+            </button>
+            <button class="sn-lp-pill-ghost" id="landing-secondary-cta" type="button" data-enter-auth="login">登录已有工作空间</button>
+          </div>
+          <ul class="sn-lp-specs" aria-label="系统核心能力" data-hero-reveal style="--d:320ms">
+            <li>
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.35" aria-hidden="true"><circle cx="10" cy="10" r="7.25"></circle><path d="M7.2 10.2l2 2 3.8-4"></path></svg>
+              <span>US / 洗衣凝珠及可扩展市场品类</span>
+            </li>
+            <li>
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.35" aria-hidden="true"><path d="M4 6.5h12M4 10h8M4 13.5h10"></path></svg>
+              <span>自动发现与人工品牌池双模式</span>
+            </li>
+            <li>
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.35" aria-hidden="true"><rect x="3.5" y="4" width="13" height="12" rx="2.5"></rect><path d="M3.5 8.5h13"></path></svg>
+              <span>SQLite / PostgreSQL 双引擎持久化</span>
+            </li>
+          </ul>
+        </div>
+
+        <aside class="sn-lp-bezel sn-lp-specimen-shell" aria-label="商机包追溯标本" data-hero-reveal style="--d:180ms">
+          <div class="sn-lp-core sn-lp-specimen">
+            <div class="sn-lp-specimen-head">
+              <div>
+                <div class="sn-lp-brand-title">
+                  <span class="sn-lp-live-dot" aria-hidden="true"></span>
+                  <strong>CleanNest Home</strong>
+                </div>
+                <span class="sn-lp-mono">cleannesthome.com · US / LAUNDRY_PODS</span>
+              </div>
+              <span class="sn-lp-status-pill">PRIORITY_REVIEW</span>
+            </div>
+
+            <div class="sn-lp-seg-wrap">
+              <div class="sn-lp-tabs" role="tablist" aria-label="追溯步骤示例">
+                <button type="button" role="tab" aria-selected="true" data-specimen-tab="evidence">01 原文取证</button>
+                <button type="button" role="tab" aria-selected="false" tabindex="-1" data-specimen-tab="fit">02 硬约束匹配</button>
+                <button type="button" role="tab" aria-selected="false" tabindex="-1" data-specimen-tab="draft">03 引用级草稿</button>
+              </div>
+            </div>
+
+            <div class="sn-lp-specimen-body">
+              <div data-specimen-panel="evidence">
+                <div class="sn-lp-meta-line">
+                  <span class="sn-lp-chip">FIRST_PARTY_BRAND</span>
+                  <span class="sn-lp-chip">AVAILABLE</span>
+                  <span class="sn-lp-mono">EV-0412 · v1</span>
+                </div>
+                <blockquote class="sn-lp-quote">"CleanNest 4-in-1 Laundry Detergent Pods, 42 ct resealable pouch — formulated for cold water, ships across the US."</blockquote>
+                <dl class="sn-lp-kv">
+                  <div>
+                    <dt>AI 事件识别</dt>
+                    <dd>新品 / 袋装规格信号（逐字匹配已核验原文片段）</dd>
+                  </div>
+                  <div>
+                    <dt>采购意向判断</dt>
+                    <dd>UNKNOWN — 未披露换厂诉求，禁止过度推断</dd>
+                  </div>
+                </dl>
+              </div>
+
+              <div data-specimen-panel="fit" hidden>
+                <div class="sn-lp-meta-line">
+                  <span class="sn-lp-chip">LANCCO 档案 v3</span>
+                  <span class="sn-lp-chip">确定性规则引擎</span>
+                </div>
+                <ul class="sn-lp-fit-rows">
+                  <li>
+                    <span>目标品类 · 洗衣凝珠 (LAUNDRY_PODS)</span>
+                    <span class="sn-lp-pass">PASS</span>
+                  </li>
+                  <li>
+                    <span>目标市场 · 美国 (US)，非禁入市场</span>
+                    <span class="sn-lp-pass">PASS</span>
+                  </li>
+                  <li>
+                    <span>起订量与包装 · 42 ct 袋装，未披露采购量</span>
+                    <span class="sn-lp-warn">待人工核验</span>
+                  </li>
+                  <li>
+                    <span>合规资质 · ISO 22716（有效期内）</span>
+                    <span class="sn-lp-pass">PASS</span>
+                  </li>
+                </ul>
+              </div>
+
+              <div data-specimen-panel="draft" hidden>
+                <div class="sn-lp-meta-line">
+                  <span class="sn-lp-chip">IN_REVIEW</span>
+                  <span class="sn-lp-chip">已核验采购职能邮箱</span>
+                </div>
+                <p class="sn-lp-draft-subject">Subject: 4-in-1 laundry pod pouch manufacturing capacity for CleanNest Home</p>
+                <div class="sn-lp-draft-text">
+                  <p>Hi Maya,</p>
+                  <p>I noticed your 42-count resealable pouch line for CleanNest 4-in-1 Laundry Detergent Pods <span class="sn-lp-cite">EV-0412 · 原文</span>. Our facility runs multi-chamber pod OEM/ODM programs with a 20,000-piece baseline MOQ on ready formulations <span class="sn-lp-cite">工厂字段 · MOQ</span>.</p>
+                  <p>If you are reviewing secondary US-bound supply options this quarter, would a spec sheet be useful?</p>
+                </div>
+              </div>
+            </div>
+
+            <p class="sn-lp-specimen-foot">工作流示例：所有事实陈述须逐句绑定已核验证据或工厂字段版本号，未审批不可复制外发。</p>
+          </div>
+        </aside>
+      </section>
+
+      <section id="landing-workflow" class="sn-lp-section" aria-labelledby="lp-workflow-title">
+        <div class="sn-lp-section-head" data-reveal>
+          <span class="sn-lp-eyebrow">End-to-End Pipeline</span>
+          <h2 id="lp-workflow-title">把盲目开发，拆成五个可审计步骤</h2>
+          <p>每一步产出的中间资料、规则明细与版本快照均可追溯，任何异常可由人工随时接管或重审。</p>
+        </div>
+
+        <div class="sn-lp-bento">
+          <article class="sn-lp-bezel sn-lp-span-7" data-reveal style="--d:0ms">
+            <div class="sn-lp-core sn-lp-bento-card">
+              <div class="sn-lp-bento-top">
+                <span class="sn-lp-step-pill">01</span>
+                <span class="sn-lp-mono">Factory Profile &amp; Versioning</span>
+              </div>
+              <h3>工厂能力建档与多规格条款</h3>
+              <p>维护分品类阶梯 MOQ、计量单位、交期、配方包装规格、合规认证有效期与禁入市场。核心字段支持逐项核验并保留完整历史版本。</p>
+              <div class="sn-lp-mini-board" aria-hidden="true">
+                <div class="sn-lp-mini-row"><span>4-Chamber Pod OEM</span><span class="sn-lp-mono">MOQ 20,000 pcs · 25–30d</span></div>
+                <div class="sn-lp-mini-row"><span>ISO 22716 / FDA</span><span class="sn-lp-pass">VALID</span></div>
+                <div class="sn-lp-mini-row"><span>Target Scope</span><span class="sn-lp-mono">US · LAUNDRY_PODS</span></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="sn-lp-bezel sn-lp-span-5" data-reveal style="--d:90ms">
+            <div class="sn-lp-core sn-lp-bento-card">
+              <div class="sn-lp-bento-top">
+                <span class="sn-lp-step-pill">02</span>
+                <span class="sn-lp-mono">DISCOVERY + POOL</span>
+              </div>
+              <h3>目标市场受控发现</h3>
+              <p>通过本地 SearXNG 与大模型筛选自动发现新品牌，也支持人工品牌池与 CSV 导入兜底；内置单任务预算、租户并发锁与崩溃恢复。</p>
+              <div class="sn-lp-chip-cloud" aria-hidden="true">
+                <span class="sn-lp-chip">SearXNG 本地检索</span>
+                <span class="sn-lp-chip">预算上限保护</span>
+                <span class="sn-lp-chip">品牌 CSV 去重</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="sn-lp-bezel sn-lp-span-4" data-reveal style="--d:140ms">
+            <div class="sn-lp-core sn-lp-bento-card">
+              <div class="sn-lp-bento-top">
+                <span class="sn-lp-step-pill">03</span>
+              </div>
+              <h3>原文取证与硬约束引擎</h3>
+              <p>保存来源 URL、观察时间与网页原文；确定性规则独立判定 PASS / CONFLICT / UNKNOWN，不把模型猜测当作资格结论。</p>
+            </div>
+          </article>
+
+          <article class="sn-lp-bezel sn-lp-span-4" data-reveal style="--d:210ms">
+            <div class="sn-lp-core sn-lp-bento-card">
+              <div class="sn-lp-bento-top">
+                <span class="sn-lp-step-pill">04</span>
+              </div>
+              <h3>引用级英文开发信</h3>
+              <p>划词或 AI 生成候选草稿，服务端校验每条事实原句与证据/工厂版本；证据失效、过期或联系人抑制立即阻断复制。</p>
+            </div>
+          </article>
+
+          <article class="sn-lp-bezel sn-lp-span-4" data-reveal style="--d:280ms">
+            <div class="sn-lp-core sn-lp-bento-card">
+              <div class="sn-lp-bento-top">
+                <span class="sn-lp-step-pill">05</span>
+              </div>
+              <h3>人工外发与漏斗复盘</h3>
+              <p>复制事件与实际发送分离记录；跟踪回复、会议、样品、报价与到期提醒，按首次审核队列去重统计真实转化率。</p>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="landing-guardrails" class="sn-lp-section" aria-labelledby="lp-guardrails-title">
+        <div class="sn-lp-section-head" data-reveal>
+          <span class="sn-lp-eyebrow">Human-in-the-Loop Guardrails</span>
+          <h2 id="lp-guardrails-title">自动化准备与人工拍板的清晰边界</h2>
+          <p>Agent 只负责压缩前期研究与核对工作量，任何不可逆商业决策始终保留给业务员。</p>
+        </div>
+
+        <div class="sn-lp-boundary-grid">
+          <div class="sn-lp-bezel" data-reveal style="--d:0ms">
+            <div class="sn-lp-core sn-lp-boundary-card">
+              <span class="sn-lp-chip">SYSTEM PREPARATION</span>
+              <h3>系统自动完成</h3>
+              <ul>
+                <li>按目标市场与已开通品类检索品牌官网与在售页面</li>
+                <li>提取产品 SKU、事件信号分类并列出待补信息</li>
+                <li>执行工厂能力条款硬约束匹配与优先级分档</li>
+                <li>从官网公开页面提取候选邮箱（保持待核验状态）</li>
+                <li>生成绑定证据原文与工厂版本的 DRAFT 候选草稿</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="sn-lp-bezel sn-lp-bezel-contrast" data-reveal style="--d:110ms">
+            <div class="sn-lp-core sn-lp-boundary-card sn-lp-boundary-contrast">
+              <span class="sn-lp-chip sn-lp-chip-contrast">HUMAN APPROVAL</span>
+              <h3>必须人工确认</h3>
+              <ul>
+                <li>核对来源页面真实性及美国/目标市场在售事实</li>
+                <li>确认商机合格（QUALIFIED）与仍待核验采购条件</li>
+                <li>核验联系人身份与来源，执行禁联或受控解除</li>
+                <li>逐字审阅并批准英文开发信（7 天时效与依赖重验）</li>
+                <li>在外部邮箱实际发送，并记录回复、样品与报价</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="landing-architecture" class="sn-lp-section" aria-labelledby="lp-arch-title">
+        <div class="sn-lp-section-head" data-reveal>
+          <span class="sn-lp-eyebrow">Security &amp; Runtime</span>
+          <h2 id="lp-arch-title">兼顾单机敏捷与企业隔离的工程底座</h2>
+          <p>零第三方 JavaScript 运行时依赖，面向长期合规留存与多团队协作而构建。</p>
+        </div>
+
+        <div class="sn-lp-arch-grid">
+          <article class="sn-lp-bezel" data-reveal style="--d:0ms">
+            <div class="sn-lp-core sn-lp-arch-card">
+              <span class="sn-lp-icon-well" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35"><path d="M12 3.5l7 3v5.5c0 4.3-2.9 7.5-7 8.5-4.1-1-7-4.2-7-8.5V6.5l7-3z"></path></svg>
+              </span>
+              <h3>多租户隔离与 RBAC</h3>
+              <p>工作区严格数据隔离，OWNER 与 MEMBER 职责分离；支持邀请链接加入、TOTP 双因素认证、会话管理与停用即时撤销。</p>
+            </div>
+          </article>
+
+          <article class="sn-lp-bezel" data-reveal style="--d:80ms">
+            <div class="sn-lp-core sn-lp-arch-card">
+              <span class="sn-lp-icon-well" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35"><circle cx="12" cy="12" r="8.5"></circle><path d="M3.8 12h16.4M12 3.5a12 12 0 0 1 0 17M12 3.5a12 12 0 0 0 0 17"></path></svg>
+              </span>
+              <h3>SSRF 防护与来源治理</h3>
+              <p>拒绝内网、回环与云元数据地址，执行 DNS 多 IP 校验与重定向复查；支持域名白名单、15 分钟限流与连续失败自动熔断。</p>
+            </div>
+          </article>
+
+          <article class="sn-lp-bezel" data-reveal style="--d:160ms">
+            <div class="sn-lp-core sn-lp-arch-card">
+              <span class="sn-lp-icon-well" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35"><path d="M7 4.5h7l4 4V19a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 19V6A1.5 1.5 0 0 1 7.5 4.5z"></path><path d="M14 4.5V8.5H18"></path></svg>
+              </span>
+              <h3>保留政策清除与安全导出</h3>
+              <p>支持不可逆清除证据原文并自动脱敏草稿引用；业务全量 CSV 导出内置公式注入防护并完整保留只追加审计日志。</p>
+            </div>
+          </article>
+
+          <article class="sn-lp-bezel" data-reveal style="--d:240ms">
+            <div class="sn-lp-core sn-lp-arch-card">
+              <span class="sn-lp-icon-well" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35"><ellipse cx="12" cy="6.5" rx="7" ry="2.8"></ellipse><path d="M5 6.5v5.5c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8V6.5"></path><path d="M5 12v5.5c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8V12"></path></svg>
+              </span>
+              <h3>双引擎持久化与外部 Worker</h3>
+              <p>支持本地 SQLite 与零第三方驱动 PostgreSQL 实时运行时；可选独立后台 Worker 执行租约队列、定时重查与 KMS 加密连接器。</p>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="sn-lp-bezel sn-lp-closing-shell" aria-labelledby="lp-closing-title" data-reveal>
+        <div class="sn-lp-core sn-lp-closing">
+          <div>
+            <span class="sn-lp-eyebrow">Ready to Start</span>
+            <h2 id="lp-closing-title">准备好整理第一批可核验的海外品牌线索了吗？</h2>
+            <p>进入工作空间后，先核对并启用工厂能力档案，即可发起首个目标市场研究任务。</p>
+          </div>
+          <div class="sn-lp-cta-row">
+            <button class="sn-lp-pill-cta" id="landing-bottom-cta" type="button" data-enter-auth="register">
+              <span class="sn-lp-cta-label">创建企业工作区</span>
+              <span class="sn-lp-orb" aria-hidden="true">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 11.5L11.5 4.5M6 4.5H11.5V10"></path></svg>
+              </span>
+            </button>
+            <button class="sn-lp-pill-ghost" id="landing-bottom-secondary" type="button" data-enter-auth="login">登录工作空间</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="sn-lp-footer">
+      <span>Botein</span>
+      <span>外贸品牌研究与合规外发工作台 · 支持 SQLite / PostgreSQL 持久化</span>
+    </footer>
+  </div>
+  <main id="auth-screen" tabindex="-1" class="sn-auth" aria-labelledby="auth-title" hidden>
+    <div class="sn-lp-auth-bar">
+      <a class="sn-brand" href="/" id="auth-brand-link">Botein</a>
+      <button class="sn-lp-link-btn" type="button" id="back-to-landing">← 返回产品介绍</button>
+    </div>
     <div class="sn-auth-panel">
       <p class="sn-kicker">Botein 工作空间</p><h1 id="auth-title">正在检查登录状态…</h1>
       <p id="auth-description" class="sn-description">数据隔离存储于工作空间数据库，读取业务数据前需要认证登录。</p>
@@ -47,7 +403,7 @@
   <div class="sn-app" id="workspace-shell" hidden>
     <header class="sn-header">
       <a class="sn-brand" href="#research" aria-label="Botein 研究工作台">Botein</a>
-      <div class="sn-workspace"><span id="workspace-name">LANCCO</span> <span class="sn-muted" id="signed-in-owner"></span> <button class="sn-button sn-secondary" id="logout-button" type="button">退出登录</button></div>
+      <div class="sn-workspace"><span id="workspace-name">LANCCO</span> <span class="sn-muted" id="signed-in-owner"></span> <a class="sn-text-link" id="workspace-landing-link" href="/welcome">产品首页</a> <button class="sn-button sn-secondary" id="logout-button" type="button">退出登录</button></div>
     </header>
     <nav class="sn-nav" aria-label="主导航">
       <a href="#research" data-page="research">市场研究</a>
@@ -173,7 +529,16 @@
       <section data-view="analytics" hidden>
         <div class="sn-page-heading"><div><p class="sn-kicker">看清真实进展</p><h1>销售漏斗</h1><p class="sn-description">选择同一批创建的商机，查看截至观察时间的去重结果。</p></div></div>
         <form id="analytics-form" class="sn-report-filter">
-          <div class="sn-report-inputs"><label class="sn-field">商机创建开始日（UTC）<input type="date" name="from" required></label><label class="sn-field">商机创建结束日（UTC）<input type="date" name="to" required></label><label class="sn-field">观察截止时间<input type="datetime-local" name="as_of"><span class="sn-helper">按本机时区输入，留空统计到当前时间。</span></label><button class="sn-button" type="submit" data-busy-label="正在统计…">更新统计</button></div>
+          <div class="sn-report-inputs">
+            <label class="sn-field">商机创建开始日（UTC）<input type="date" name="from" required></label>
+            <label class="sn-field">商机创建结束日（UTC）<input type="date" name="to" required></label>
+            <label class="sn-field">观察截止时间<input type="datetime-local" name="as_of"><span class="sn-helper">按本机时区输入，留空统计到当前时间。</span></label>
+            <label class="sn-field">跟进负责人<input type="text" name="assigned_to" placeholder="全部负责人" maxlength="64"></label>
+            <label class="sn-field">产品品类<select name="product_category"><option value="">全部品类</option><option value="LAUNDRY_PODS">洗衣凝珠</option><option value="DISHWASHER_TABS">洗碗凝珠/块</option><option value="SCENT_BOOSTERS">留香珠</option><option value="FABRIC_SOFTENER_SHEETS">柔顺片</option></select></label>
+            <label class="sn-field">目标市场<select name="market"><option value="ALL">全部市场</option><option value="US">美国 (US)</option><option value="CA">加拿大 (CA)</option><option value="UK">英国 (UK)</option><option value="EU">欧盟 (EU)</option></select></label>
+            <label class="sn-field">研究批次 ID<input type="text" name="research_job_id" placeholder="全部批次" maxlength="100"></label>
+            <button class="sn-button" type="submit" data-busy-label="正在统计…">更新统计</button>
+          </div>
           <p class="sn-form-error" role="alert" hidden></p>
         </form>
         <div id="analytics-results" aria-live="polite"></div>

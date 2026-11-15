@@ -89,9 +89,21 @@ function navigate() {
     }
   }
 }
-window.addEventListener('hashchange', () => { navigate(); $('#main').focus(); });
-$('.sn-skip').addEventListener('click', event => { event.preventDefault(); const target = $('#workspace-shell').hidden ? $('#auth-screen') : $('#main'); target.focus(); target.scrollIntoView(); });
-navigate();
+window.addEventListener('hashchange', () => {
+  if ($('#workspace-shell').hidden) return;
+  navigate();
+  $('#main').focus();
+});
+$('.sn-skip').addEventListener('click', event => {
+  event.preventDefault();
+  const target = !$('#workspace-shell').hidden
+    ? $('#main')
+    : !$('#landing-screen').hidden
+      ? $('#landing-screen')
+      : $('#auth-screen');
+  target.focus();
+  target.scrollIntoView();
+});
 
 let dynamicFieldSeq = 0;
 function addProductionTermRow(term = {}) {
@@ -873,7 +885,7 @@ async function loadResearchResults(jobId) {
   catch (error) { $('#research-results').innerHTML = `<p role="alert">${escape(error.message)}</p>`; }
 }
 function stopResearchPolling() {
-  if (state.researchPollTimer) clearInterval(state.researchPollTimer);
+  if (state.researchPollTimer) clearTimeout(state.researchPollTimer);
   state.researchPollTimer = null; state.researchPollingId = null;
 }
 async function pollResearchJob(id) {
@@ -881,6 +893,7 @@ async function pollResearchJob(id) {
   stopResearchPolling();
   state.researchPollingId = id;
   const tick = async () => {
+    if (state.researchPollingId !== id) return;
     try {
       const job = await api(`/research-jobs/${encodeURIComponent(id)}`);
       const idx = (state.researchJobs || []).findIndex(item => item.id === id);
@@ -893,15 +906,14 @@ async function pollResearchJob(id) {
         await refreshScope('research', 'accounts', 'evidence', 'opportunities', 'ai_runs');
         await loadResearchResults(id);
         notify(`研究任务${researchStatusLabels[job.status] || job.status}。人工审核与销售记录未被覆盖。`);
-      } else {
-        notify(`研究任务执行中：${researchStatusLabels[job.status] || job.status}${job.current_step ? ` · ${researchStepLabels[job.current_step] || job.current_step}` : ''}`);
+      } else if (state.researchPollingId === id) {
+        state.researchPollTimer = setTimeout(() => { tick().catch(() => {}); }, 2500);
       }
     } catch (error) {
       stopResearchPolling(); notify(error.message);
     }
   };
   await tick();
-  if (state.researchPollingId === id) state.researchPollTimer = setInterval(tick, 2000);
 }
 async function retryResearchJob(id) {
   try {
@@ -1103,7 +1115,7 @@ function renderOpportunityDetail() {
     ${draftUI.render(d)}
     <section class="sn-detail-section"><div class="sn-section-heading"><h3>下一步跟进</h3><button class="sn-button sn-secondary" data-task-new="${escape(d.id)}">安排待办</button></div>${state.tasks.filter(t => t.opportunity_id === d.id).map(taskRow).join('') || '<p class="sn-muted">还没有安排下一步，可以设置截止时间并记录要确认的事项。</p>'}</section>
     <section class="sn-detail-section"><div class="sn-section-heading"><h3>销售活动</h3><button class="sn-button sn-secondary" data-activity-add>记录活动</button></div><p class="sn-helper">仅记录外部实际发生的活动，不发送邮件，不验证外部发送结果。</p>
-      ${d.activities.map(a => `<div class="sn-record"><h3>${activityLabels[a.activity_type]}${a.voided_at ? ' · 已作废' : ''}</h3><p class="sn-helper">${date(a.occurred_at)}${a.full_name ? ` · ${escape(a.full_name)}${a.email ? ` / ${escape(a.email)}` : ''}` : ''} · 人工补录</p>${a.contact_snapshot ? `<p class="sn-helper">${JSON.parse(a.contact_snapshot).provenance === 'MIGRATED_CURRENT_RECORD' ? '联系人为升级时资料快照，未证明历史发送时身份。' : '联系人信息为录入此活动时保存的快照。'}</p>` : ''}${a.draft_version_id ? `<p class="sn-helper">已关联发送时的草稿版本：${escape(a.draft_version_id.slice(0, 8))}（内容见上方版本历史）</p>` : ''}${a.activity_type === 'REPLY_RECEIVED' ? `<p>${sentimentLabels[a.reply_sentiment]}</p>` : ''}${a.activity_type === 'DEAL_WON' ? `<p>成交金额：${a.amount_cents === null ? '未知' : `${(a.amount_cents / 100).toFixed(2)} ${escape(a.currency)}`}</p>` : ''}<p>${escape(a.notes)}</p>${a.voided_at ? `<p class="sn-helper">作废原因：${escape(a.void_reason)}</p>` : `<button class="sn-button sn-secondary" data-record="activity" data-id="${escape(a.id)}" data-action="void">更正误录</button>`}</div>`).join('') || '<p class="sn-muted">尚无销售活动。复制信息或查看联系人不会改变销售阶段。</p>'}
+      ${d.activities.map(a => `<div class="sn-record"><h3>${activityLabels[a.activity_type]}${a.voided_at ? ' · 已作废' : ''}</h3><p class="sn-helper">${date(a.occurred_at)}${a.full_name ? ` · ${escape(a.full_name)}${a.email ? ` / ${escape(a.email)}` : ''}` : ''} · 人工补录</p>${a.contact_snapshot ? `<p class="sn-helper">${JSON.parse(a.contact_snapshot).provenance === 'MIGRATED_CURRENT_RECORD' ? '联系人为升级时资料快照，未证明历史发送时身份。' : '联系人信息为录入此活动时保存的快照。'}</p>` : ''}${a.draft_version_id ? `<p class="sn-helper">已关联发送时的草稿版本：${escape(a.draft_version_id.slice(0, 8))}（内容见上方版本历史）</p>` : ''}${a.activity_type === 'REPLY_RECEIVED' ? `<p>${sentimentLabels[a.reply_sentiment]}</p>` : ''}${a.activity_type === 'DEAL_WON' ? `<p>成交金额：${a.amount_cents === null ? '未知' : `${(a.amount_cents / 100).toFixed(2)} ${escape(a.currency)}`}</p>` : ''}<p>${escape(a.notes)}</p>${a.voided_at ? `<p class="sn-helper">作废原因：${escape(a.void_reason)}</p>` : isOwner() ? `<button class="sn-button sn-secondary" data-record="activity" data-id="${escape(a.id)}" data-action="void">更正误录</button>` : ''}</div>`).join('') || '<p class="sn-muted">尚无销售活动。复制信息或查看联系人不会改变销售阶段。</p>'}
     </section>
     <details class="sn-history-details"><summary>审核与活动历史（${d.history.length} 条）</summary><ol>${d.history.map(h => `<li>${date(h.created_at)} · ${escape(actionLabels[h.action] || h.action)} · ${escape(h.snapshot?.actor || '负责人')}<br>${escape(h.reason)}${h.snapshot.from ? `<br>${qualificationLabels[h.snapshot.from]} → ${qualificationLabels[h.snapshot.to]}` : ''}</li>`).join('')}</ol></details>`;
   const assignSelect = $('#opportunity-assign-select');
@@ -1128,7 +1140,8 @@ function openOpportunityReview() {
   if (!state.detail) return;
   const form = $('#opportunity-review-form'), d = state.detail;
   form.reset(); clearError(form); form.dataset.id = d.id; form.dataset.version = d.version;
-  form.elements.action.innerHTML = availableActions[d.qualification_status].map(action => `<option value="${action}">${actionLabels[action]}</option>`).join('');
+  const actionsForRole = (availableActions[d.qualification_status] || []).filter(action => action !== 'REOPEN' || isOwner());
+  form.elements.action.innerHTML = actionsForRole.map(action => `<option value="${action}">${actionLabels[action]}</option>`).join('');
   form.elements.reason.value = d.reason;
   form.elements.pending_info.value = d.pending_info || '采购量、MOQ、包装条件及交期需求待确认。';
   for (const role of ['product', 'market', 'reason']) {
@@ -1299,6 +1312,10 @@ async function loadAnalytics() {
   const values = new FormData(analyticsForm), query = new URLSearchParams();
   query.set('from', values.get('from')); query.set('to', values.get('to'));
   if (values.get('as_of')) query.set('as_of', new Date(values.get('as_of')).toISOString());
+  if (String(values.get('assigned_to') || '').trim()) query.set('assigned_to', String(values.get('assigned_to')).trim());
+  if (String(values.get('product_category') || '').trim()) query.set('product_category', String(values.get('product_category')).trim());
+  if (String(values.get('market') || '').trim() && values.get('market') !== 'ALL') query.set('market', String(values.get('market')).trim());
+  if (String(values.get('research_job_id') || '').trim()) query.set('research_job_id', String(values.get('research_job_id')).trim());
   $('#analytics-results').innerHTML = '<p class="sn-muted">正在统计这批商机…</p>';
   try {
     const report = await api(`/analytics/funnel?${query}`);
@@ -1338,7 +1355,7 @@ function renderAnalytics(report) {
         <div><h4>研究失败环节分布</h4>${(b.research_failure_steps || []).length ? `<ul class="sn-history">${b.research_failure_steps.map(r => `<li>${escape(researchStepLabels[r.step] || r.step)} (${r.count} 次)</li>`).join('')}</ul>` : '<p class="sn-muted">本期无研究失败记录</p>'}</div>
       </div>
     </div>`;
-  $('#analytics-results').innerHTML = `${!m.candidates ? '<p class="sn-result-note">所选日期内暂无商机。可以调整创建日期范围，或先在商机跟进中添加已有品牌。</p>' : ''}<div class="sn-report-summary"><div><h2>首次审核合格率</h2><strong class="sn-report-rate">${rate}</strong><p class="sn-helper">${m.qualified} 个首次合格 / ${m.reviewed} 个首次已审核${m.reviewed ? '' : '，暂无可计算分母'}</p></div><div class="sn-report-current"><h2>这批商机的当前状态</h2><p>当前合格 ${report.current.qualified} 个 · 待重评 ${report.current.reassessment_required} 个 · 待审核或补资料 ${report.current.pending} 个</p><p class="sn-helper">规则匹配（ELIGIBLE）商机：${b.matched_opportunity_count ?? 0} 个；与首次审核结论分开，不改写历史合格率。</p></div></div>
+  $('#analytics-results').innerHTML = `${!m.candidates ? '<p class="sn-result-note">所选日期内暂无商机。可以调整创建日期范围，或先在商机跟进中添加已有品牌。</p>' : ''}<div class="sn-report-summary"><div><h2>首次审核合格率</h2><strong class="sn-report-rate">${rate}</strong><p class="sn-helper">${m.qualified} 个首次合格 / ${m.reviewed} 个首次已审核${m.reviewed ? '' : '，暂无可计算分母'}</p></div><div class="sn-report-current"><h2>这批商机的当前状态</h2><p>当前合格 ${report.current.qualified} 个 · 待重评 ${report.current.reassessment_required} 个 · 待审核或补资料 ${report.current.pending} 个</p><p class="sn-helper">规则匹配（ELIGIBLE）商机：${b.matched_opportunity_count ?? 0} 个 · 研究任务 ${report.operations?.research_jobs ?? 0} 次 · 证据 ${report.operations?.evidence_verified ?? 0}/${report.operations?.evidence_total ?? 0} 已核验。</p></div></div>
     <p class="sn-helper sn-scroll-hint">表格可左右滚动查看统计依据。</p><div class="sn-table-region" tabindex="0" role="region" aria-label="商机去重统计表"><table class="sn-table sn-report-table"><caption>${escape(f.from)} 至 ${escape(f.to)}（UTC）创建的商机，每个阶段按商机去重</caption><thead><tr><th scope="col">阶段</th><th scope="col" class="sn-numeric">商机数</th><th scope="col">统计依据</th></tr></thead><tbody>${metrics.map(([label, value, rule]) => `<tr><th scope="row">${label}</th><td class="sn-numeric">${value}</td><td>${rule}</td></tr>`).join('')}</tbody></table></div>
     ${breakdownHtml}
     <div class="sn-report-footnote"><p>观察截止：${escape(f.as_of.replace('T', ' ').replace('Z', ' UTC'))}。生成时间：${escape(report.generated_at.replace('T', ' ').replace('Z', ' UTC'))}。</p><p>范围：当前工作空间全部创建商机（含研究自动入池与人工录入）。活动按实际发生时间统计，已作废活动排除；后补或更正历史记录可能改变往期结果。</p><p>允许业务阶段跳跃，各行不要求逐级递减；自动发现线索默认保持待人工审核，必须经负责人审核通过后方可推进触达。</p></div>`;
@@ -1521,4 +1538,4 @@ const accountUI = setupAccounts({ api, state, refresh, refreshScope, notify, esc
 const transferUI = setupTransfer({ api, state, refresh, refreshScope, notify, escape, formHandler });
 const productUI = setupProducts({ api, state, refresh, refreshScope, notify, escape, formHandler, date });
 const draftUI = setupDrafts({ api, state, refresh, refreshScope, notify, escape, formHandler, date });
-startAuth({ onAuthenticated: refresh, notify, dirty: () => state.factoryDirty, clearDirty: () => { state.factoryDirty = false; } });
+startAuth({ onAuthenticated: refresh, onEnterWorkspace: navigate, notify, dirty: () => state.factoryDirty, clearDirty: () => { state.factoryDirty = false; } });

@@ -1,6 +1,11 @@
+import { setupLanding } from './landing.js';
 const $ = selector => document.querySelector(selector);
-export function startAuth({ onAuthenticated, notify, dirty, clearDirty }) {
+export function startAuth({ onAuthenticated, onEnterWorkspace, notify, dirty, clearDirty }) {
   let setup = false, multiOrgEnabled = true, authMode = 'login', authenticated = false, reloading = false, currentUser = null, checking = false;
+  const landing = setupLanding({
+    onEnterAuth: mode => enterAuth(mode, { pushHistory: true }),
+    onEnterWorkspace: () => enterWorkspace({ pushHistory: true }),
+  });
   async function request(path, body) {
     const response = await fetch(`/api/v1/auth${path}`, { method: body ? 'POST' : 'GET', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
     const raw = await response.text();
@@ -92,12 +97,54 @@ export function startAuth({ onAuthenticated, notify, dirty, clearDirty }) {
     if ($('#mfa-setup-panel')) $('#mfa-setup-panel').hidden = enabled;
     if ($('#mfa-disable-form')) $('#mfa-disable-form').hidden = !enabled;
   }
+  function enterAuth(mode = authMode, { pushHistory = false } = {}) {
+    if ($('#boot-screen')) $('#boot-screen').hidden = true;
+    if ($('#landing-screen')) $('#landing-screen').hidden = true;
+    $('#auth-screen').hidden = false;
+    $('#auth-description').textContent = setup ? '首次设置只创建本地登录账号，现有工厂和业务资料会继续保留。' : '登录后继续整理线索、审核草稿和跟进客户。';
+    const allowed = ['login', 'register', 'accept_invite', 'reset_request', 'reset_confirm', 'setup'];
+    let targetMode = allowed.includes(mode) ? mode : 'login';
+    if (setup) targetMode = 'setup';
+    else if (targetMode === 'register' && !multiOrgEnabled) targetMode = 'login';
+    applyAuthFormMode(targetMode);
+    if (pushHistory && location.pathname !== '/app') history.pushState({ view: 'auth', mode: targetMode }, '', '/app');
+    $('#auth-screen').focus();
+  }
+  function enterLanding({ pushHistory = false } = {}) {
+    if ($('#boot-screen')) $('#boot-screen').hidden = true;
+    $('#auth-screen').hidden = true;
+    $('#workspace-shell').hidden = true;
+    if ($('#landing-screen')) $('#landing-screen').hidden = false;
+    document.title = 'Botein · 海外品牌智能开发工作台';
+    if (pushHistory) {
+      if (authenticated) {
+        if (location.pathname !== '/welcome') history.pushState({ view: 'landing' }, '', '/welcome');
+      } else if (location.pathname === '/app') {
+        history.pushState({ view: 'landing' }, '', '/');
+      }
+    }
+    $('#landing-screen')?.focus();
+  }
+  function enterWorkspace({ pushHistory = false } = {}) {
+    if ($('#boot-screen')) $('#boot-screen').hidden = true;
+    if ($('#landing-screen')) $('#landing-screen').hidden = true;
+    $('#auth-screen').hidden = true;
+    $('#workspace-shell').hidden = false;
+    if (location.pathname === '/app') history.replaceState({}, '', `/${location.hash}`);
+    else if (pushHistory && location.pathname === '/welcome') history.pushState({ view: 'workspace' }, '', `/${location.hash}`);
+    onEnterWorkspace?.();
+    const title = document.querySelector('[data-view]:not([hidden]) h1')?.textContent || '工作空间';
+    document.title = `${title} · Botein`;
+    $('#main').focus();
+  }
   async function status() {
     $('#auth-retry').hidden = true;
     try {
       const info = await request('/status');
       setup = info.setup_required;
       multiOrgEnabled = info.multi_org_enabled !== false;
+      landing.syncLandingState({ setupRequired: setup, multiOrgEnabled, authenticated: Boolean(info.authenticated) });
+      if ($('#boot-screen')) $('#boot-screen').hidden = true;
       if (info.authenticated) {
         currentUser = info.user;
         const roleLabel = info.user.role === 'OWNER' ? '负责人 (OWNER)' : '团队成员 (MEMBER)';
@@ -110,15 +157,21 @@ export function startAuth({ onAuthenticated, notify, dirty, clearDirty }) {
         $('#signed-in-owner').textContent = ` / ${info.user.display_name} (${info.user.role || 'OWNER'})`;
         $('#auth-session-info').textContent = `账号 ${info.user.username} · ${roleLabel} · 工作区 ${info.organization?.name || '本地'} · 本次登录到期 ${new Date(info.expires_at).toLocaleString('zh-CN')}。`;
         updateMfaUi();
-        $('#auth-screen').hidden = true; $('#workspace-shell').hidden = false;
-        const title = document.querySelector('[data-view]:not([hidden]) h1')?.textContent || '工作空间';
-        document.title = `${title} · Botein`;
-        $('#main').focus();
+        if (location.pathname === '/welcome') enterLanding({ pushHistory: false });
+        else enterWorkspace({ pushHistory: false });
         return;
       }
-      $('#auth-description').textContent = setup ? '首次设置只创建本地登录账号，现有工厂和业务资料会继续保留。' : '登录后继续整理线索、审核草稿和跟进客户。';
-      applyAuthFormMode(setup ? 'setup' : authMode);
+      const queryMode = new URLSearchParams(location.search).get('auth');
+      const hasNotice = Boolean($('#auth-feedback').textContent.trim());
+      if (location.pathname === '/app' || hasNotice || queryMode) {
+        enterAuth(queryMode || authMode, { pushHistory: false });
+      } else {
+        enterLanding({ pushHistory: false });
+      }
     } catch (error) {
+      if ($('#boot-screen')) $('#boot-screen').hidden = true;
+      if ($('#landing-screen')) $('#landing-screen').hidden = true;
+      $('#auth-screen').hidden = false;
       $('#auth-feedback').textContent = `读取失败：${error.message}`;
       $('#auth-retry').hidden = false;
     }
@@ -126,6 +179,25 @@ export function startAuth({ onAuthenticated, notify, dirty, clearDirty }) {
   $('#auth-feedback').textContent = sessionStorage.getItem('botein-auth-message') || '';
   sessionStorage.removeItem('botein-auth-message');
   $('#auth-retry').addEventListener('click', status);
+  $('#back-to-landing')?.addEventListener('click', () => enterLanding({ pushHistory: true }));
+  $('#auth-brand-link')?.addEventListener('click', event => {
+    event.preventDefault();
+    enterLanding({ pushHistory: true });
+  });
+  $('#workspace-landing-link')?.addEventListener('click', event => {
+    if (!authenticated) return;
+    event.preventDefault();
+    enterLanding({ pushHistory: true });
+  });
+  window.addEventListener('popstate', () => {
+    if (authenticated) {
+      if (location.pathname === '/welcome') enterLanding({ pushHistory: false });
+      else enterWorkspace({ pushHistory: false });
+      return;
+    }
+    if (location.pathname === '/app') enterAuth(authMode, { pushHistory: false });
+    else enterLanding({ pushHistory: false });
+  });
   $('#auth-mode-actions')?.addEventListener('click', event => {
     const btn = event.target.closest('[data-auth-mode]');
     if (btn) applyAuthFormMode(btn.dataset.authMode);

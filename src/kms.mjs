@@ -1,19 +1,60 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from 'node:crypto';
 
 const DEV_FALLBACK_SEED = 'botein-dev-kms-local-fallback-do-not-use-in-prod';
+let warnedFallback = false;
+
+function configuredMasterKey() {
+  return String(
+    process.env.KMS_MASTER_KEY
+    || process.env.BOTEIN_KMS_KEY
+    || process.env.CONNECTOR_ENCRYPTION_KEY
+    || ''
+  ).trim();
+}
+
+function kmsEndpoint() {
+  return String(process.env.KMS_ENDPOINT_URL || process.env.KMS_HTTP_ENDPOINT || '').trim();
+}
+
+function kmsHeaders() {
+  const headers = { 'Content-Type': 'application/json' };
+  const token = String(process.env.KMS_ENDPOINT_TOKEN || '').trim();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
+export function isKmsProductionEnforced() {
+  return process.env.NODE_ENV === 'production' || process.env.ENFORCE_KMS_KEY === '1';
+}
+
+export function assertKmsConfigured() {
+  if (!configuredMasterKey() && !kmsEndpoint() && isKmsProductionEnforced()) {
+    throw new Error('生产环境必须配置 KMS_MASTER_KEY（或 KMS_ENDPOINT_URL），禁止使用内置开发密钥。');
+  }
+}
 
 function deriveLocalKey() {
-  const raw = process.env.KMS_MASTER_KEY || process.env.BOTEIN_KMS_KEY || DEV_FALLBACK_SEED;
-  return createHash('sha256').update(raw, 'utf8').digest();
+  const configured = configuredMasterKey();
+  if (!configured) {
+    if (isKmsProductionEnforced()) {
+      throw new Error('生产环境必须配置 KMS_MASTER_KEY，禁止使用内置开发密钥。');
+    }
+    if (!warnedFallback && process.env.NODE_ENV !== 'test' && !process.env.NODE_TEST_CONTEXT) {
+      warnedFallback = true;
+      console.warn('[KMS WARNING] KMS_MASTER_KEY 未配置，当前正在使用开发默认密钥，切勿用于生产环境。');
+    }
+  }
+  return createHash('sha256').update(configured || DEV_FALLBACK_SEED, 'utf8').digest();
 }
 
 export function kmsStatus() {
-  const endpoint = process.env.KMS_HTTP_ENDPOINT ? process.env.KMS_HTTP_ENDPOINT.trim() : '';
-  const hasMasterKey = Boolean(process.env.KMS_MASTER_KEY || process.env.BOTEIN_KMS_KEY);
+  const endpoint = kmsEndpoint();
+  const hasMasterKey = Boolean(configuredMasterKey());
   return {
     provider: endpoint ? 'http-kms' : 'local-aes256gcm',
     configured_master_key: hasMasterKey,
     endpoint_configured: Boolean(endpoint),
+    token_configured: Boolean(String(process.env.KMS_ENDPOINT_TOKEN || '').trim()),
   };
 }
 
@@ -49,11 +90,12 @@ export function unsealSecret(payload) {
 }
 
 export async function sealSecretRemote(plaintext) {
-  const endpoint = process.env.KMS_HTTP_ENDPOINT ? process.env.KMS_HTTP_ENDPOINT.trim() : '';
+  const endpoint = kmsEndpoint();
   if (!endpoint) return sealSecret(plaintext);
   const response = await fetch(`${endpoint.replace(/\/+$/, '')}/seal`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: kmsHeaders(),
+    signal: AbortSignal.timeout(10_000),
     body: JSON.stringify({ plaintext }),
   });
   if (!response.ok) throw new Error(`KMS seal error (${response.status})`);
@@ -62,11 +104,12 @@ export async function sealSecretRemote(plaintext) {
 }
 
 export async function unsealSecretRemote(ciphertext) {
-  const endpoint = process.env.KMS_HTTP_ENDPOINT ? process.env.KMS_HTTP_ENDPOINT.trim() : '';
+  const endpoint = kmsEndpoint();
   if (!endpoint || String(ciphertext || '').startsWith('v1:')) return unsealSecret(ciphertext);
   const response = await fetch(`${endpoint.replace(/\/+$/, '')}/unseal`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: kmsHeaders(),
+    signal: AbortSignal.timeout(10_000),
     body: JSON.stringify({ ciphertext }),
   });
   if (!response.ok) throw new Error(`KMS unseal error (${response.status})`);
@@ -124,11 +167,20 @@ export function generateTotp(secretBase32, timestampMs = Date.now(), stepSeconds
   return String(code % 1_000_000).padStart(6, '0');
 }
 
-export function verifyTotp(secretBase32, token, timestampMs = Date.now(), window = 1) {
+export function verifyTotpStep(secretBase32, token, timestampMs = Date.now(), window = 1, lastUsedStep = -1, stepSeconds = 30) {
   const clean = String(token ?? '').trim();
-  if (!/^\d{6}$/.test(clean)) return false;
+  if (!/^\d{6}$/.test(clean)) return { valid: false, step: -1 };
+  const baseStep = Math.floor(timestampMs / 1000 / stepSeconds);
   for (let delta = -window; delta <= window; delta++) {
-    if (generateTotp(secretBase32, timestampMs + delta * 30_000) === clean) return true;
+    const step = baseStep + delta;
+    if (step <= lastUsedStep) continue;
+    if (generateTotp(secretBase32, step * stepSeconds * 1000, stepSeconds) === clean) {
+      return { valid: true, step };
+    }
   }
-  return false;
+  return { valid: false, step: -1 };
+}
+
+export function verifyTotp(secretBase32, token, timestampMs = Date.now(), window = 1) {
+  return verifyTotpStep(secretBase32, token, timestampMs, window).valid;
 }

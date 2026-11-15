@@ -271,7 +271,7 @@ function candidateOrder(a, b) {
 
 function createOpportunity(db, jobId, accountId, productCategory = 'LAUNDRY_PODS', ctx = null) {
   const { orgId, actor } = requestContext(ctx);
-  const existing = db.prepare('SELECT id, qualification_status, product_category, account_id FROM opportunities WHERE organization_id=? AND account_id=? AND product_category=?')
+  const existing = db.prepare('SELECT id, qualification_status, product_category, account_id, estimated_order_quantity FROM opportunities WHERE organization_id=? AND account_id=? AND product_category=?')
     .get(orgId, accountId, productCategory);
   if (existing) {
     const fit = evaluateOpportunityFit(db, existing, orgId);
@@ -301,22 +301,22 @@ function draftStatusForOpportunity(db, orgId, opportunityId) {
   return row?.status ?? 'NOT_GENERATED';
 }
 
-function saveResult(db, jobId, candidate, opportunityId, isNew, factoryVersion, ctx = null) {
+function saveResult(db, jobId, candidate, opportunityId, isNew, factoryVersion, ctx = null, attempt = 1) {
   const { orgId } = requestContext(ctx);
   const draftStatus = draftStatusForOpportunity(db, orgId, opportunityId);
   db.prepare(`INSERT INTO research_job_results
-    (organization_id,research_job_id,account_id,opportunity_id,tier,reason,missing_info,evidence_snapshot,contact_snapshot,next_actions,factory_version,is_new,draft_status,fit_status,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    (organization_id,research_job_id,account_id,opportunity_id,tier,reason,missing_info,evidence_snapshot,contact_snapshot,next_actions,factory_version,is_new,draft_status,fit_status,attempt,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(research_job_id,account_id) DO UPDATE SET
       opportunity_id=COALESCE(research_job_results.opportunity_id,excluded.opportunity_id),
       tier=excluded.tier, reason=excluded.reason, missing_info=excluded.missing_info,
       evidence_snapshot=excluded.evidence_snapshot, contact_snapshot=excluded.contact_snapshot,
       next_actions=excluded.next_actions, factory_version=excluded.factory_version,
-      draft_status=excluded.draft_status, fit_status=excluded.fit_status`)
+      draft_status=excluded.draft_status, fit_status=excluded.fit_status, attempt=excluded.attempt`)
     .run(orgId, jobId, candidate.account_id, opportunityId, candidate.tier, candidate.reason,
       JSON.stringify(candidate.missing), JSON.stringify(candidate.evidence), JSON.stringify(candidate.contact),
       JSON.stringify(candidate.next_actions), factoryVersion, isNew ? 1 : 0, draftStatus, candidate.fit_status || 'NEEDS_REVIEW',
-      new Date().toISOString());
+      attempt, new Date().toISOString());
 }
 
 function mergeUsageIntoBudget(budgetJson, baseUsage, delta = {}) {
@@ -331,10 +331,11 @@ function mergeUsageIntoBudget(budgetJson, baseUsage, delta = {}) {
   return budget;
 }
 
-function failJob(db, id, error, ctx = null, budgetOverride = null) {
+function failJob(db, id, error, ctx = null, budgetOverride = null, attempt = null) {
   const { orgId } = requestContext(ctx);
   const row = db.prepare('SELECT * FROM research_jobs WHERE organization_id=? AND id=?').get(orgId, id);
   if (!row || ['COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED'].includes(row.status)) return;
+  if (attempt !== null && row.attempt !== attempt) return;
   const counts = JSON.parse(row.counts);
   counts.failed = Math.max(1, counts.failed ?? 0);
   const stopReason = error?.code === 'JOB_CANCELLED' || error?.code === 'RESEARCH_CANCELLED'
@@ -342,15 +343,23 @@ function failJob(db, id, error, ctx = null, budgetOverride = null) {
     : 'DEPENDENCY_FAILURE';
   const finalStatus = stopReason === 'USER_CANCELLED' ? 'CANCELLED' : 'FAILED';
   const nextBudget = budgetOverride ? JSON.stringify(budgetOverride) : row.budget;
-  db.prepare(`UPDATE research_jobs SET status=?,current_step=NULL,stop_reason=?,counts=?,budget=?,
-    worker_id=NULL,lease_expires_at=NULL,finished_at=?,version=version+1 WHERE id=? AND organization_id=?`)
-    .run(finalStatus, stopReason, JSON.stringify(counts), nextBudget, new Date().toISOString(), id, orgId);
-  audit(db, finalStatus === 'CANCELLED' ? 'RESEARCH_JOB_CANCELLED' : 'RESEARCH_JOB_FAILED', id, {
-    reason: error instanceof AppError ? error.code : 'INTERNAL_ERROR',
-  }, ctx);
+  const res = db.prepare(`UPDATE research_jobs SET status=?,current_step=NULL,stop_reason=?,counts=?,budget=?,
+    worker_id=NULL,lease_expires_at=NULL,finished_at=?,version=version+1 WHERE id=? AND organization_id=? AND attempt=?`)
+    .run(finalStatus, stopReason, JSON.stringify(counts), nextBudget, new Date().toISOString(), id, orgId, row.attempt);
+  if (res.changes) {
+    audit(db, finalStatus === 'CANCELLED' ? 'RESEARCH_JOB_CANCELLED' : 'RESEARCH_JOB_FAILED', id, {
+      reason: error instanceof AppError ? error.code : 'INTERNAL_ERROR',
+      attempt: row.attempt,
+    }, ctx);
+  }
 }
 
-function step(db, id, value, orgId = ORG) {
+function step(db, id, value, orgId = ORG, attempt = null) {
+  if (attempt !== null) {
+    db.prepare("UPDATE research_jobs SET current_step=?,heartbeat_at=?,version=version+1 WHERE id=? AND organization_id=? AND status='RUNNING' AND attempt=?")
+      .run(value, new Date().toISOString(), id, orgId, attempt);
+    return;
+  }
   db.prepare("UPDATE research_jobs SET current_step=?,heartbeat_at=?,version=version+1 WHERE id=? AND organization_id=? AND status='RUNNING'")
     .run(value, new Date().toISOString(), id, orgId);
 }
@@ -392,12 +401,13 @@ function runPool(db, id, input, _services, _signal, ctx = null) {
   return transaction(db, () => {
     const starting = jobRow(db, id, orgId);
     if (starting.status === 'CANCELLED') return jobView(starting);
+    const attempt = starting.attempt;
     const started = Date.now(), now = new Date().toISOString();
-    db.prepare("UPDATE research_jobs SET status='RUNNING',current_step='DISCOVERING',started_at=COALESCE(started_at,?),version=version+1 WHERE id=? AND organization_id=?")
-      .run(now, id, orgId);
+    db.prepare("UPDATE research_jobs SET status='RUNNING',current_step='DISCOVERING',started_at=COALESCE(started_at,?),version=version+1 WHERE id=? AND organization_id=? AND attempt=?")
+      .run(now, id, orgId, attempt);
     const factory = factoryReadiness(db, input, orgId);
     const accounts = db.prepare('SELECT * FROM accounts WHERE organization_id=? ORDER BY created_at, id').all(orgId);
-    step(db, id, 'ANALYZING', orgId);
+    step(db, id, 'ANALYZING', orgId, attempt);
     const candidates = accounts.map(account => analyseAccount(db, account, input, orgId));
     const eligible = candidates.filter(candidate => candidate.tier !== 'NOT_FIT').sort(candidateOrder);
     const selected = eligible.slice(0, input.quantity);
@@ -407,7 +417,7 @@ function runPool(db, id, input, _services, _signal, ctx = null) {
       not_fit: notFit.length, new_opportunities: 0, reused_opportunities: 0,
       missing_contacts: 0, drafts_generated: 0,
     };
-    step(db, id, 'CONTACT_ENRICHING', orgId);
+    step(db, id, 'CONTACT_ENRICHING', orgId, attempt);
     for (const candidate of selected) {
       let opportunityId = candidate.opportunity_id, isNew = false;
       if (candidate.has_pods) {
@@ -416,21 +426,21 @@ function runPool(db, id, input, _services, _signal, ctx = null) {
         if (result.created) counts.new_opportunities++; else counts.reused_opportunities++;
       }
       if (candidate.contact.total === 0) counts.missing_contacts++;
-      saveResult(db, id, candidate, opportunityId, isNew, factory.version, ctx);
+      saveResult(db, id, candidate, opportunityId, isNew, factory.version, ctx, attempt);
       counts.processed++;
     }
     for (const candidate of notFit) {
-      saveResult(db, id, candidate, null, false, factory.version, ctx);
+      saveResult(db, id, candidate, null, false, factory.version, ctx, attempt);
       counts.processed++;
     }
     const reachedTarget = eligible.length > selected.length;
     const budget = JSON.parse(jobRow(db, id, orgId).budget);
     budget.usage.runtime_ms += Date.now() - started;
     db.prepare(`UPDATE research_jobs SET status='COMPLETED',current_step=NULL,stop_reason=?,counts=?,budget=?,
-      finished_at=?,version=version+1 WHERE id=? AND organization_id=?`)
+      worker_id=NULL,lease_expires_at=NULL,finished_at=?,version=version+1 WHERE id=? AND organization_id=? AND attempt=?`)
       .run(reachedTarget ? 'TARGET_REACHED' : 'SOURCE_SCOPE_EXHAUSTED', JSON.stringify(counts), JSON.stringify(budget),
-        new Date().toISOString(), id, orgId);
-    audit(db, 'RESEARCH_JOB_COMPLETED', id, { source_mode: 'POOL', counts }, ctx);
+        new Date().toISOString(), id, orgId, attempt);
+    audit(db, 'RESEARCH_JOB_COMPLETED', id, { source_mode: 'POOL', counts, attempt }, ctx);
     return jobView(jobRow(db, id, orgId));
   });
 }
@@ -439,11 +449,15 @@ async function runDiscovery(db, id, input, services, signal, ctx = null) {
   const { orgId } = requestContext(ctx);
   const starting = jobRow(db, id, orgId);
   if (starting.status === 'CANCELLED' || starting.cancel_requested === 1 || signal?.aborted) return jobView(starting);
+  const attempt = starting.attempt;
+  const prevDoneAccounts = attempt > 1
+    ? new Set(db.prepare('SELECT account_id FROM research_job_results WHERE organization_id=? AND research_job_id=?').all(orgId, id).map(r => r.account_id))
+    : new Set();
   const started = Date.now(), now = new Date().toISOString();
   const initialBudget = JSON.parse(starting.budget);
   db.prepare(`UPDATE research_jobs SET status='RUNNING',current_step='DISCOVERING',started_at=COALESCE(started_at,?),heartbeat_at=?,version=version+1
-    WHERE id=? AND organization_id=?`).run(now, now, id, orgId);
-  step(db, id, 'ENRICHING', orgId);
+    WHERE id=? AND organization_id=? AND attempt=?`).run(now, now, id, orgId, attempt);
+  step(db, id, 'ENRICHING', orgId, attempt);
   let latestUsage = { search_requests: 0, page_requests: 0, cost_usd: 0, runtime_ms: 0 };
   let discovery;
   try {
@@ -451,14 +465,14 @@ async function runDiscovery(db, id, input, services, signal, ctx = null) {
       db, input, services, budget: initialBudget, research_job_id: id, signal, ctx,
       shouldStop: () => {
         const cur = jobRow(db, id, orgId);
-        return signal?.aborted || cur.status === 'CANCELLED' || cur.cancel_requested === 1;
+        return signal?.aborted || cur.status === 'CANCELLED' || cur.cancel_requested === 1 || cur.attempt !== attempt;
       },
-      onStep: value => step(db, id, value, orgId),
+      onStep: value => step(db, id, value, orgId, attempt),
       onUsage: delta => {
         latestUsage = delta;
         const merged = mergeUsageIntoBudget(starting.budget, initialBudget.usage, delta);
-        db.prepare('UPDATE research_jobs SET budget=?,heartbeat_at=? WHERE id=? AND organization_id=?')
-          .run(JSON.stringify(merged), new Date().toISOString(), id, orgId);
+        db.prepare("UPDATE research_jobs SET budget=?,heartbeat_at=? WHERE id=? AND organization_id=? AND status='RUNNING' AND attempt=?")
+          .run(JSON.stringify(merged), new Date().toISOString(), id, orgId, attempt);
       },
     });
   } catch (error) {
@@ -466,23 +480,25 @@ async function runDiscovery(db, id, input, services, signal, ctx = null) {
     const elapsed = Math.max(partial.runtime_ms ?? 0, Date.now() - started);
     const persistedBudget = mergeUsageIntoBudget(starting.budget, initialBudget.usage, { ...partial, runtime_ms: elapsed });
     const current = jobRow(db, id, orgId);
+    if (current.attempt !== attempt) return jobView(current);
     if (current.status === 'CANCELLED' || current.cancel_requested === 1 || error?.code === 'JOB_CANCELLED' || error?.code === 'RESEARCH_CANCELLED') {
       db.prepare(`UPDATE research_jobs SET status='CANCELLED',current_step=NULL,stop_reason='USER_CANCELLED',
-        budget=?,worker_id=NULL,lease_expires_at=NULL,finished_at=COALESCE(finished_at,?) WHERE id=? AND organization_id=?`)
-        .run(JSON.stringify(persistedBudget), new Date().toISOString(), id, orgId);
+        budget=?,worker_id=NULL,lease_expires_at=NULL,finished_at=COALESCE(finished_at,?) WHERE id=? AND organization_id=? AND attempt=?`)
+        .run(JSON.stringify(persistedBudget), new Date().toISOString(), id, orgId, attempt);
       return jobView(jobRow(db, id, orgId));
     }
     transaction(db, () => {
-      db.prepare('INSERT INTO research_job_failures VALUES (?,?,?,?,?,?,?)')
-        .run(randomUUID(), orgId, id, null, 'DISCOVERY', error.message, new Date().toISOString());
-      failJob(db, id, error, ctx, persistedBudget);
+      db.prepare('INSERT INTO research_job_failures (id,organization_id,research_job_id,account_id,step,reason,attempt,created_at) VALUES (?,?,?,?,?,?,?,?)')
+        .run(randomUUID(), orgId, id, null, 'DISCOVERY', error.message, attempt, new Date().toISOString());
+      failJob(db, id, error, ctx, persistedBudget, attempt);
     });
     throw error;
   }
 
   let extraSearch = 0, extraPages = 0, extraCost = 0;
+  let stopReason = discovery.stop_reason || null;
   const enrichmentNotes = [];
-  step(db, id, 'CONTACT_ENRICHING', orgId);
+  step(db, id, 'CONTACT_ENRICHING', orgId, attempt);
 
   const limits = initialBudget.limits ?? { search_requests: 50, page_requests: 200, cost_usd: 5, runtime_ms: 1_800_000 };
   const usedSearch = () => (initialBudget.usage.search_requests ?? 0) + (discovery.counts.search_requests ?? 0) + extraSearch;
@@ -492,52 +508,61 @@ async function runDiscovery(db, id, input, services, signal, ctx = null) {
 
   for (const candidate of discovery.candidates) {
     const cur = jobRow(db, id, orgId);
-    if (signal?.aborted || cur.status === 'CANCELLED' || cur.cancel_requested === 1 || remainingRuntime() <= 0) break;
-    // Optional AI signal assessment on newly discovered unverified evidence
-    if (candidate.evidence_id && services.modelConfig?.().configured && usedCost() < (limits.cost_usd ?? 5)) {
+    if (cur.attempt !== attempt) return jobView(cur);
+    if (signal?.aborted || cur.status === 'CANCELLED' || cur.cancel_requested === 1) {
+      stopReason = 'USER_CANCELLED';
+      break;
+    }
+    if (remainingRuntime() <= 0) { stopReason = stopReason || 'TIME_LIMIT'; break; }
+    if (prevDoneAccounts.has(candidate.account_id)) continue;
+
+    if (candidate.evidence_id && services.modelConfig?.().configured) {
+      if (usedCost() >= (limits.cost_usd ?? 5)) { stopReason = stopReason || 'BUDGET_EXHAUSTED'; break; }
       const existingAssessment = db.prepare('SELECT id FROM signal_assessments WHERE organization_id=? AND evidence_id=?').get(orgId, candidate.evidence_id);
       if (!existingAssessment) {
         try {
           const assessed = await analyzeEvidence(db, candidate.evidence_id, services, { research_job_id: id, signal, ctx });
           extraCost += Number(assessed.usage?.cost_usd ?? 0) || 0;
         } catch (error) {
-          if (error?.code === 'RESEARCH_CANCELLED') break;
+          if (error?.code === 'RESEARCH_CANCELLED') { stopReason = 'USER_CANCELLED'; break; }
           enrichmentNotes.push({ account_id: candidate.account_id, step: 'ANALYSIS', code: error?.code || 'SKIPPED', reason: error.message });
         }
       }
     }
-    // Optional public contact discovery if account currently has no contacts and search/page budget permits
     const currentContacts = contactSnapshot(db, candidate.account_id, orgId);
-    if (currentContacts.total === 0
-      && usedSearch() + 4 <= (limits.search_requests ?? 50)
-      && usedPages() + 5 <= (limits.page_requests ?? 200)
-      && usedCost() < (limits.cost_usd ?? 5)
-      && remainingRuntime() > 0) {
-      try {
-        const contactRes = await discoverContacts(db, candidate.account_id, services, { signal, research_job_id: id, ctx });
-        extraSearch += contactRes.body?.counts?.search_requests ?? 0;
-        extraPages += contactRes.body?.counts?.page_requests ?? 0;
-        extraCost += Number(contactRes.body?.usage?.cost_usd ?? 0) || 0;
-      } catch (error) {
-        if (error?.code === 'RESEARCH_CANCELLED') break;
-        extraSearch += 4;
-        enrichmentNotes.push({ account_id: candidate.account_id, step: 'CONTACT', code: error?.code || 'SKIPPED', reason: error.message });
+    if (currentContacts.total === 0) {
+      if (remainingRuntime() <= 0) { stopReason = stopReason || 'TIME_LIMIT'; break; }
+      if (usedSearch() + 4 > (limits.search_requests ?? 50) || usedPages() + 5 > (limits.page_requests ?? 200) || usedCost() >= (limits.cost_usd ?? 5)) {
+        stopReason = stopReason || 'BUDGET_EXHAUSTED';
+        enrichmentNotes.push({ account_id: candidate.account_id, step: 'CONTACT', code: 'BUDGET_EXHAUSTED', reason: '研究预算已达上限，跳过联系人自动发现。' });
+      } else {
+        try {
+          const contactRes = await discoverContacts(db, candidate.account_id, services, { signal, research_job_id: id, ctx });
+          extraSearch += contactRes.body?.counts?.search_requests ?? 0;
+          extraPages += contactRes.body?.counts?.page_requests ?? 0;
+          extraCost += Number(contactRes.body?.usage?.cost_usd ?? contactRes.usage?.cost_usd ?? 0) || 0;
+        } catch (error) {
+          if (error?.code === 'RESEARCH_CANCELLED') { stopReason = 'USER_CANCELLED'; break; }
+          extraSearch += error?.partialUsage?.search_requests ?? 0;
+          extraPages += error?.partialUsage?.page_requests ?? 0;
+          enrichmentNotes.push({ account_id: candidate.account_id, step: 'CONTACT', code: error?.code || 'SKIPPED', reason: error.message });
+        }
       }
     }
   }
 
   const matchedCandidates = transaction(db, () => {
     const current = jobRow(db, id, orgId);
-    if (current.status === 'CANCELLED' || current.cancel_requested === 1) return null;
+    if (current.attempt !== attempt || current.status === 'CANCELLED' || current.cancel_requested === 1) return null;
     const factory = profile(db, orgId);
-    step(db, id, 'MATCHING', orgId);
+    step(db, id, 'MATCHING', orgId, attempt);
     const createdOpps = [];
     for (const candidate of discovery.candidates) {
       const account = db.prepare('SELECT * FROM accounts WHERE id=? AND organization_id=?').get(candidate.account_id, orgId);
       if (!account) continue;
       const opp = createOpportunity(db, id, account.id, candidate.product_category || input.product_categories[0], ctx);
       const analysed = analyseAccount(db, account, input, orgId);
-      saveResult(db, id, analysed, opp.id, opp.created, factory.version, ctx);
+      saveResult(db, id, analysed, opp.id, opp.created, factory.version, ctx, attempt);
       createdOpps.push({ opp, analysed });
     }
     return createdOpps;
@@ -546,19 +571,26 @@ async function runDiscovery(db, id, input, services, signal, ctx = null) {
   if (matchedCandidates === null) return jobView(jobRow(db, id, orgId));
 
   let draftsGenerated = 0;
-  step(db, id, 'DRAFTING', orgId);
+  step(db, id, 'DRAFTING', orgId, attempt);
   for (const { opp, analysed } of matchedCandidates) {
     const cur = jobRow(db, id, orgId);
-    if (signal?.aborted || cur.status === 'CANCELLED' || cur.cancel_requested === 1 || remainingRuntime() <= 0) break;
+    if (cur.attempt !== attempt) return jobView(cur);
+    if (signal?.aborted || cur.status === 'CANCELLED' || cur.cancel_requested === 1) {
+      stopReason = 'USER_CANCELLED';
+      break;
+    }
+    if (remainingRuntime() <= 0) { stopReason = stopReason || 'TIME_LIMIT'; break; }
     if (analysed.tier === 'NOT_FIT') continue;
-    if (!services.modelConfig?.().configured || usedCost() >= (limits.cost_usd ?? 5)) continue;
     const existingDraft = db.prepare('SELECT id FROM drafts WHERE organization_id=? AND opportunity_id=?').get(orgId, opp.id);
     if (existingDraft) continue;
+    if (!services.modelConfig?.().configured) continue;
+    if (usedCost() >= (limits.cost_usd ?? 5)) { stopReason = stopReason || 'BUDGET_EXHAUSTED'; break; }
     try {
-      await generateDraft(db, opp.id, {}, services, { ...ctx, research_job_id: id }, { allowUnverifiedCandidate: true });
+      const draftRes = await generateDraft(db, opp.id, {}, services, { ...ctx, research_job_id: id }, { allowUnverifiedCandidate: true });
+      extraCost += Number(draftRes?.usage?.cost_usd ?? 0) || 0;
       draftsGenerated++;
     } catch (error) {
-      if (error?.code === 'RESEARCH_CANCELLED') break;
+      if (error?.code === 'RESEARCH_CANCELLED') { stopReason = 'USER_CANCELLED'; break; }
       const code = error?.code === 'NO_VERIFIED_CONTACT'
         ? 'CONTACT_NOT_FOUND'
         : error?.code === 'NO_VERIFIED_EVIDENCE'
@@ -570,6 +602,7 @@ async function runDiscovery(db, id, input, services, signal, ctx = null) {
 
   return transaction(db, () => {
     const current = jobRow(db, id, orgId);
+    if (current.attempt !== attempt) return jobView(current);
     if (current.status === 'CANCELLED' || current.cancel_requested === 1) {
       const partialBudget = mergeUsageIntoBudget(current.budget, initialBudget.usage, {
         search_requests: (discovery.counts.search_requests ?? 0) + extraSearch,
@@ -577,8 +610,8 @@ async function runDiscovery(db, id, input, services, signal, ctx = null) {
         cost_usd: (discovery.counts.cost_usd ?? 0) + extraCost,
         runtime_ms: Date.now() - started,
       });
-      db.prepare(`UPDATE research_jobs SET budget=?,worker_id=NULL,lease_expires_at=NULL WHERE id=? AND organization_id=?`)
-        .run(JSON.stringify(partialBudget), id, orgId);
+      db.prepare(`UPDATE research_jobs SET budget=?,worker_id=NULL,lease_expires_at=NULL WHERE id=? AND organization_id=? AND attempt=?`)
+        .run(JSON.stringify(partialBudget), id, orgId, attempt);
       return jobView(jobRow(db, id, orgId));
     }
     const factory = profile(db, orgId);
@@ -592,23 +625,22 @@ async function runDiscovery(db, id, input, services, signal, ctx = null) {
       search_requests: stepSearch, page_requests: stepPages, cost_usd: stepCost,
     };
     for (const failure of discovery.failures) {
-      db.prepare('INSERT INTO research_job_failures VALUES (?,?,?,?,?,?,?)')
-        .run(randomUUID(), orgId, id, failure.account_id ?? null, failure.step, failure.reason, new Date().toISOString());
+      db.prepare('INSERT INTO research_job_failures (id,organization_id,research_job_id,account_id,step,reason,attempt,created_at) VALUES (?,?,?,?,?,?,?,?)')
+        .run(randomUUID(), orgId, id, failure.account_id ?? null, failure.step, failure.reason, attempt, new Date().toISOString());
     }
     for (const { opp, analysed } of matchedCandidates) {
       if (opp.created) counts.new_opportunities++;
       else counts.reused_opportunities++;
-      saveResult(db, id, analysed, opp.id, opp.created, factory.version, ctx);
+      saveResult(db, id, analysed, opp.id, opp.created, factory.version, ctx, attempt);
       counts.processed++;
       if (analysed.tier === 'NOT_FIT') counts.not_fit++;
       if (analysed.contact.total === 0) counts.missing_contacts++;
     }
+    const interruptedEarly = Boolean(stopReason && stopReason !== 'SOURCE_SCOPE_EXHAUSTED' && stopReason !== 'TARGET_REACHED');
     const failed = discovery.failures.length > 0 && discovery.candidates.length === 0;
-    const partial = discovery.failures.length > 0 && discovery.candidates.length > 0;
+    const partial = !failed && ((discovery.failures.length > 0 && discovery.candidates.length > 0) || interruptedEarly);
     const status = failed ? 'FAILED' : partial ? 'PARTIAL' : 'COMPLETED';
-    const stop = discovery.stop_reason
-      ? discovery.stop_reason
-      : (failed || partial ? 'DEPENDENCY_FAILURE' : 'SOURCE_SCOPE_EXHAUSTED');
+    const stop = stopReason || ((failed || partial) ? 'DEPENDENCY_FAILURE' : 'SOURCE_SCOPE_EXHAUSTED');
 
     const budget = mergeUsageIntoBudget(starting.budget, initialBudget.usage, {
       search_requests: stepSearch,
@@ -622,11 +654,11 @@ async function runDiscovery(db, id, input, services, signal, ctx = null) {
       enrichment_notes: enrichmentNotes,
     };
     db.prepare(`UPDATE research_jobs SET status=?,current_step=NULL,stop_reason=?,counts=?,budget=?,details=?,
-      worker_id=NULL,lease_expires_at=NULL,finished_at=?,version=version+1 WHERE id=? AND organization_id=?`)
+      worker_id=NULL,lease_expires_at=NULL,finished_at=?,version=version+1 WHERE id=? AND organization_id=? AND attempt=?`)
       .run(status, stop, JSON.stringify(counts), JSON.stringify(budget), JSON.stringify(details),
-        new Date().toISOString(), id, orgId);
+        new Date().toISOString(), id, orgId, attempt);
     audit(db, failed ? 'RESEARCH_JOB_FAILED' : 'RESEARCH_JOB_COMPLETED', id, {
-      source_mode: 'DISCOVERY', counts, details,
+      source_mode: 'DISCOVERY', attempt, status, stop_reason: stop, counts, details,
     }, ctx);
     return jobView(jobRow(db, id, orgId));
   });
@@ -778,10 +810,14 @@ export async function researchApi(db, path, method, body, query, services, ctx =
 
   if ((match = path.match(/^\/research-jobs\/([^/]+)\/failures$/)) && method === 'GET') {
     const row = jobRow(db, match[1], orgId);
+    const reqAttempt = query.get('attempt');
+    const items = reqAttempt && /^\d+$/.test(reqAttempt)
+      ? db.prepare('SELECT id,account_id,step,reason,attempt,created_at FROM research_job_failures WHERE organization_id=? AND research_job_id=? AND attempt=? ORDER BY created_at, id')
+        .all(orgId, row.id, Number(reqAttempt))
+      : db.prepare('SELECT id,account_id,step,reason,attempt,created_at FROM research_job_failures WHERE organization_id=? AND research_job_id=? ORDER BY created_at, id')
+        .all(orgId, row.id);
     return {
-      status: 200, body: {
-        items: db.prepare('SELECT id,account_id,step,reason,created_at FROM research_job_failures WHERE organization_id=? AND research_job_id=? ORDER BY created_at, id').all(orgId, row.id),
-      },
+      status: 200, body: { items, current_attempt: row.attempt },
     };
   }
 

@@ -147,11 +147,15 @@ export function factoryInput(body) {
     };
   });
 
+  const capQty = body.monthly_capacity_quantity === '' || body.monthly_capacity_quantity == null ? null : body.monthly_capacity_quantity;
+  requireValue(capQty === null || (Number.isSafeInteger(capQty) && capQty > 0), '月产能请填正整数。', 'monthly_capacity_quantity');
+
   return {
     factory_name: text(body.factory_name, 'factory_name', 100), website: publicUrl(body.website),
     supported_products: [...new Set(body.supported_products)], service_type: [...new Set(body.service_type)],
     target_markets: [...new Set(body.target_markets)], moq_quantity: moq, unit,
     packaging_spec: packaging, lead_time_days: days,
+    ...(capQty != null ? { monthly_capacity_quantity: capQty } : {}),
     production_terms, certifications, prohibited_markets,
     notes: text(body.notes ?? '', 'notes', 4000, false),
   };
